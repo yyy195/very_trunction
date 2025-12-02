@@ -43,6 +43,7 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
     # prime: PrimeRewardManager
     # batch: BatchRewardManager
     # dapo: DAPORewardManager
+    # Majority: MajorityRewardManager
     # Note(haibin.lin): For custom reward managers, please make sure they are imported and
     # registered via `verl.workers.reward_manager.register`
     # By default reward_manager is set to naive (NaiveRewardManager)

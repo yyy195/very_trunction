@@ -108,7 +108,7 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
 
 
 def load_reward_manager(
-    config: DictConfig, tokenizer: Any, num_examine: int, flag: bool, **reward_kwargs: Any
+    config: DictConfig, tokenizer: Any, num_examine: int, **reward_kwargs: Any
 ) -> AbstractRewardManager:
     """
     Load and initialize a reward manager based on the configuration.
@@ -128,14 +128,8 @@ def load_reward_manager(
     compute_score = get_custom_reward_fn(config)
     final_compute_score = compute_score
 
-    # 每个prompt会散发出多少条轨迹
-    rollout_n = config.actor_rollout_ref.rollout.n
-    print("\n-------\n Rollout_n correct:{n}\n-------\n".format(n=rollout_n))
-    reward_manager_name = config.reward_model.get("reward_manager", "majority")
-    print("\n-------\n Before:RewardManagerName:{name}\n-------\n".format(name=reward_manager_name))
-    config.reward_model.reward_manager = "majority"
-    reward_manager_name = config.reward_model.get("reward_manager", "majority")
-    print("\n-------\n After:RewardManagerName:{name}\n-------\n".format(name=reward_manager_name))
+
+    reward_manager_name = config.reward_model.get("reward_manager", "naive")
     reward_manager_cls = get_reward_manager_cls(reward_manager_name)
 
     if compute_score is None:
@@ -161,8 +155,6 @@ def load_reward_manager(
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
-        rollout_n=rollout_n,
-        flag=flag,
         **reward_kwargs,
     )
 

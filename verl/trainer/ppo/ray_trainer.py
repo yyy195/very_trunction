@@ -537,6 +537,8 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        print("\n-------_Validate Start--------\n")
+
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -545,6 +547,7 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
+
 
             # repeat test batch
             test_batch = test_batch.repeat(
@@ -576,7 +579,7 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
 
             # pad to be divisible by dp_size
             size_divisor = (
@@ -592,7 +595,6 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
             print("validation generation end")
 
             # Store generated outputs
@@ -601,6 +603,7 @@ class RayPPOTrainer:
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
+ 
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
@@ -963,6 +966,8 @@ class RayPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+
+        # breakpoint()
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,

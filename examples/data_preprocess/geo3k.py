@@ -28,9 +28,9 @@ if __name__ == "__main__":
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--local_dataset_path", default=None, help="The local path to the raw dataset, if it exists.")
     parser.add_argument(
-        "--local_save_dir", default="~/data/geo3k", help="The save directory for the preprocessed dataset."
+        "--local_save_dir", default="/data1/yyy25/datasets", help="The save directory for the preprocessed dataset."
     )
-
+    # /data1/yyy25/datasets
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
 
