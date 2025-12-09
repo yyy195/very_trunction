@@ -101,6 +101,12 @@ do_sample: True
 # number of responses (i.e. num sample times). > 1 for grpo
 n: 1
 
+# truncation-resample batch size
+cut_n: 3
+
+# truncation-rate
+cut_keep_rate: 0.7
+
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,
 # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.
 over_sample_rate: 0

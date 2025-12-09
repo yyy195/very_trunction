@@ -178,6 +178,10 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    cut_n: Optional[int] = None
+
+    cut_keep_rate: Optional[float] = None
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

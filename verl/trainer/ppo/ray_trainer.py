@@ -28,6 +28,7 @@ from pprint import pprint
 from typing import Optional
 
 import numpy as np
+from pandas.core.base import NoNewAttributesMixin
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -35,7 +36,7 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from verl import DataProto
+from verl import DataProto # 数据说明已在子文件中进行理解
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -55,10 +56,16 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.workers.reward_manager import batch
+
+from verl.utils.add_noise import image_augment_from_PIL
+from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+from verl.utils.data_processor import DATA_PROCESSOR_MAP
 
 
 @dataclass
@@ -177,7 +184,10 @@ def compute_response_mask(data: DataProto):
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
 
-
+'''
+注意，所有更新用的Advantage和reward都是从这里出的，最后公式中更新的reward就是这个函数安徽的return。
+但是如果想自己设计reward等的相关，应该关注compute_reward函数，compute_advantage这个函数是对优势和reward进行后处理的
+'''
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -206,7 +216,7 @@ def compute_advantage(
         DataProto: The updated data with computed advantages and returns.
     """
     # Back-compatible with trainers that do not compute response mask in fit
-    if "response_mask" not in data.batch.keys():
+    if "response_mask" not in data.batch.keys(): # 如果没有responsemask就计算
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
@@ -231,8 +241,9 @@ def compute_advantage(
         grpo_calculation_mask = data.batch["response_mask"]
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
+        # ⏰⏰
+        advantages, returns = core_algos.compute_grpo_outcome_advantage( # 计算优势和回报
+            token_level_rewards=data.batch["token_level_rewards"],# 这里面的return是根据即时奖励计算出未来的累积折扣奖励
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
@@ -308,8 +319,22 @@ class RayPPOTrainer:
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor
+        
+        
+
+        # Instantiate the tokenizer and processor.
+        
+        from verl.utils.fs import copy_to_local
+        self.local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+        self.trust_remote_code = config.data.get("trust_remote_code", False)
+        # Used for multimodal LLM, could be None
+        
+
+
         self.config = config
-        self.reward_fn = reward_fn
+        self.reward_fn = reward_fn # 用于计算奖励的函数
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -328,17 +353,20 @@ class RayPPOTrainer:
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
-        )
+        )# 启用评测记录，比如wandb
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = (
+        # self.ref_in_actor 是一个布尔值，表示 Reference Policy 的模型权重是否嵌入在 Actor Policy 的 Worker 中。
+        # 为什么RefPolicy的权重会被嵌入在ActorPolicy当中呢？因为ref的策略参数是一直不会动的，只有policy的策略会动
+        # W_ref=W_0 W_policy=W_0+BA 所以把ref的权重嵌入进去避免重复加载权重
+        self.ref_in_actor = ( 
             config.actor_rollout_ref.model.get("lora_rank", 0) > 0
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
+        ) # 如果用了lora，输入lora的path
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
-        if self.config.algorithm.use_kl_in_reward:
+        if self.config.algorithm.use_kl_in_reward: # KL散度奖励
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -374,9 +402,13 @@ class RayPPOTrainer:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
+        # collate_fn是dataset中的数据转换成tensor形式并且可供模型进行训练使用,‼️他还可以进行动态填充，识别
+        # 最长的序列然后用padding token将他们填充到同一长度
 
         num_workers = self.config.data["dataloader_num_workers"]
 
+
+        # 这个Statefuldataloader是分布式训练中可以进行检查点恢复的dataloader
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
@@ -409,12 +441,13 @@ class RayPPOTrainer:
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
-        if self.config.trainer.total_training_steps is not None:
+        if self.config.trainer.total_training_steps is not None: # 如果用户指定了训练步骤 允许直接覆盖使用
             total_training_steps = self.config.trainer.total_training_steps
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
+        # 利用OmegaConf将trainingsteps安全写入actor和critic
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
@@ -426,6 +459,7 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        # 将 rollout/验证样本以 JSONL 格式转储到文件中。
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -453,7 +487,7 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _log_rollout_data(
+    def _log_rollout_data( # 将rollout数据记录到磁盘
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
         """Log rollout data to disk.
@@ -464,8 +498,8 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -484,8 +518,46 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+    
+    
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _cut_log_rollout_data( # 将rollout数据记录到磁盘
+        self, batch: DataProto,  rollout_data_dir: str
+    ):
+        """Log rollout data to disk.
+        Args:
+            batch (DataProto): The batch containing rollout data
+            reward_extra_infos_dict (dict): Additional reward information to log
+            timing_raw (dict): Timing information for profiling
+            rollout_data_dir (str): Directory path to save the rollout data
+        """
+        
+        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+
+        # 2. 准备文件路径
+        os.makedirs(rollout_data_dir, exist_ok=True)
+        filename = os.path.join(rollout_data_dir, f"{self.global_steps}.jsonl")
+
+        # 3. 构建 JSON Lines 列表
+        lines = []
+        n = len(inputs)
+
+        for i in range(n):
+            # 为每个样本创建只包含 input 和 output 的字典
+            entry = {
+                "input": inputs[i],
+                "output": outputs[i],
+            }
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        # 4. 写入文件
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped prompt and rollout results to {filename}")
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):# 将验证样本的生成结果记录到配置的日志器（如 wandb 或 swanlab）中
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -509,7 +581,7 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+    def _get_gen_batch(self, batch: DataProto) -> DataProto: # 从原始批次中获取用于生成（generation）的批次数据
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
@@ -526,7 +598,8 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _validate(self):
+    def _validate(self): # 执行验证（validation）过程，计算奖励模型的分数并记录生成样本
+        """Validate the model on the validation dataset."""
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -537,23 +610,22 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
-        print("\n-------_Validate Start--------\n")
 
-
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        for test_data in self.val_dataloader: # 默认所有的验证样本都参与验证，所以len(val_dataloader) = 1
+            test_batch = DataProto.from_single_dict(test_data) # 转化成DataProto格式
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
-
-
+            print("\n -------_validate stage -------- \n")
+            print("Original Test_batch len:{}\n".format(len(test_batch)))
             # repeat test batch
+            # 每个原始验证样本会被重复多少次（根据val_kwargs.n进行重复）
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
-
+            print("After Repeated Test_batch len:{}\n".format(len(test_batch)))
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
@@ -562,15 +634,18 @@ class RayPPOTrainer:
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            # 获取输入id，并将对应id的文本解码为输入文本
             sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            sample_uids.extend(test_batch.non_tensor_batch["uid"]) # 放入sample 
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
+            ] # 提取真实的groundtruth并用于接下来的评估
+            sample_gts.extend(ground_truths) # 放入sample   
 
-            test_gen_batch = self._get_gen_batch(test_batch)
+            # ._get_gen_batch 将test_batch转换为适合模型进行序列生成的格式
+            test_gen_batch = self._get_gen_batch(test_batch) #准备用于模型生成的批次。
+            print("Test_gen_batch len:{}\n".format(len(test_gen_batch)))
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -579,7 +654,7 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
-
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
             size_divisor = (
@@ -590,20 +665,29 @@ class RayPPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # 用 actor worker group来生成序列。这是模型实际进行推理并生成输出的地方。
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size) # 恢复原始长度
+            print("After Unpadded Test_output_gen_batch len:{}\n".format(len(test_output_gen_batch)))
+
+
             print("validation generation end")
 
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_ids = test_output_gen_batch.batch["responses"] # 存储
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids] # 解码
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
- 
+            '''
+            模型生成序列之后， test_output_gen_batch 包含了模型生成的响应（ responses ）以及其
+            他生成相关的输出（例如， log_probs ）。而 test_batch 仍然包含原始的输入提示和一些初始元数据。 
+            union 操作将这两部分数据合并到一个 DataProto 对象中。为了保证数据的完整性
+            '''
+            print("After Union Test_batch len:{}\n".format(len(test_batch)))
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
@@ -898,6 +982,7 @@ class RayPPOTrainer:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _start_profiling(self, do_profile: bool) -> None:
+        # 启动所有组的性能分析
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
@@ -910,6 +995,7 @@ class RayPPOTrainer:
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
+        # 停止所有组的性能分析
         if do_profile:
             self.actor_rollout_wg.stop_profile()
             if self.use_reference_policy:
@@ -921,6 +1007,7 @@ class RayPPOTrainer:
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        # 有的attention_mask长度大，有的小，这样的长度大的GPU结束时间比较长，长度小的结束快，GPU就空置了，利用率不高
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
@@ -955,6 +1042,278 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+    def _truncate_batch_before(self, gen_cut_batch: DataProto):# 传入的gen_cut_batch形状是batch_size*rollout_n
+        import verl.utils.torch_functional as verl_F
+        from verl.utils import hf_processor
+        # from verl.utils.dataset.vision_utils import process_image
+        data_processor = hf_processor(self.local_path, trust_remote_code=self.trust_remote_code, use_fast=True)
+
+        prompt_token_ids = gen_cut_batch.batch["input_ids"] # gen_cut_batch.batch.size()=([1024]) gen.batch是个字典
+        # batch的key['attention_mask', 'responses', 'position_ids', 'prompts', 'input_ids']
+        # "inputs_ids是标识符" prompts才是用于生成的
+        response_token_ids = gen_cut_batch.batch["responses"]
+        # attention_mask = gen_cut_batch.batch["attention_mask"] # 恢复attention_mask引用
+        inputs = data_processor.tokenizer.batch_decode(prompt_token_ids, skip_special_tokens=True)
+        
+        cut_response_idx = [int(len(item) * self.config.actor_rollout_ref.rollout.cut_keep_rate) for item in response_token_ids]
+        # cut_response_idx = int(len(response_token_ids) * self.config.actor_rollout_ref.rollout.cut_keep_rate)  # 修正整数转换
+        for idx in cut_response_idx:
+            cut_response = response_token_ids[:, :idx]
+        outputs = data_processor.tokenizer.batch_decode(cut_response, skip_special_tokens=True) 
+        inputs = [p+r for p,r in zip(inputs,outputs)]
+        
+        
+
+        '''
+        那所以prompt和response我应该从DataProto中的batch解码获得，
+        剩下的从non_tensor_Dict中获得，然后重新进行一遍处理和后处理的步骤是吗
+        '''
+        # 现在image,prompt,attentionmask等都需要重新处理并用类似的逻辑变回from_dict的形式
+        
+        # 我应该将这个batch按照RLHF的逻辑处理成一个batch，然后再用from_single_dict进行加载
+        processed_row_dicts=[]
+        max_prompt_length = self.config.data.max_prompt_length
+        truncation = self.config.get("truncation","right") # 源代码中全是error
+        need_tools_kwargs = self.config.get("need_tools_kwargs", False)
+        iteration = 0
+        image_patch_size = self.config.get("image_patch_size", 14)
+
+
+        for i in range(len(gen_cut_batch)):#1024
+            item = gen_cut_batch[i]
+            row_dict:dict = {} # item.batch['input_ids'].size:torch.Size([768])
+            multi_modal_data = {} # 
+            original_images = item.non_tensor_batch['multi_modal_data']['image'] # non_tensor_batch的keys ['data_source', 'reward_model', 'extra_info', 'uid', 'index', 'interaction_kwargs', 'tools_kwargs', 'ability', 'multi_modal_inputs']
+            noise_imgs = image_augment_from_PIL(original_images) #  
+            # noise_imgs = [process_image(image, image_patch_size=image_patch_size) for image in noise_imgs] # 处理并存储在images列表中
+            multi_modal_data["image"] = noise_imgs # 直接用original_images也是错了
+
+            augment_inputs = data_processor(
+                text=[inputs[i]],images=noise_imgs,videos=None,return_tensors="pt"
+            )
+            # todo1:按照scs的processor外面初始化封装传进来（全新的）
+            # todo2:用vllm直接加载
+            input_ids = augment_inputs.pop("input_ids")
+            attention_mask = augment_inputs.pop("attention_mask")
+
+            if "second_per_grid_ts" in augment_inputs:
+                augment_inputs.pop("second_per_grid_ts")
+            row_dict["multi_modal_data"] = multi_modal_data
+            row_dict["multi_modal_inputs"] = dict(augment_inputs)
+            row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
+
+            
+            # 注意，我这块先用了truncation = 'right'试验一下
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_prompt_length,  # 匹配数据集max_prompt_length 这个没有引用到
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,  # 匹配数据集左填充规则
+                truncation='right'  # 匹配数据集截断策略（error/left/right/middle）
+            )
+
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+            row_dict["input_ids"] = input_ids[0]
+            row_dict["attention_mask"] = attention_mask[0]
+            row_dict["position_ids"] = position_ids[0]
+
+            
+
+            raw_prompt_ids = self.tokenizer.encode(inputs[i],add_special_tokens=False) # inputs格式错误
+            if len(raw_prompt_ids) > max_prompt_length: # max_prompt_length 没定义，self.truncation没定义
+                if truncation == "left":
+                    raw_prompt_ids = raw_prompt_ids[-max_prompt_length :]
+                elif truncation == "right":
+                    raw_prompt_ids = raw_prompt_ids[:max_prompt_length]
+                elif truncation == "middle":
+                    left_half = max_prompt_length // 2
+                    right_half = max_prompt_length - left_half
+                    raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+                elif truncation == "error":
+                    raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length}.")
+                
+            row_dict["raw_prompt_ids"] = raw_prompt_ids
+            if "extra_info" not in row_dict or row_dict["extra_info"] is None:
+                row_dict["extra_info"] = dict()
+            index = row_dict.get("extra_info", {}).get("index", 0)
+            tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
+            interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
+            
+            need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", need_tools_kwargs)
+            if need_tools_kwargs and not tools_kwargs:
+                logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
+            row_dict["index"] = index
+            row_dict["tools_kwargs"] = tools_kwargs
+            row_dict["interaction_kwargs"] = interaction_kwargs
+            processed_row_dicts.append(row_dict)
+            iteration += 1
+
+        # 本地实现list_of_dict_to_dict_of_list辅助逻辑（因未找到全局函数）
+        
+        # 将row_dict列表转换为DataProto格式
+        print("\n DEBUG:Iteration is {}\n".format(iteration))
+        batch_dict = default_collate_fn(processed_row_dicts)
+        return DataProto.from_single_dict(batch_dict)
+    def _truncate_batch(self,gen_cut_batch:DataProto):
+        
+        import verl.utils.torch_functional as verl_F    
+
+        messages = gen_cut_batch.non_tensor_batch['before_message']
+        '''
+        
+        '''
+        response_token_ids = gen_cut_batch.batch['responses']
+        # 那不对啊，他们其实都被填充到一样的长度了
+        cut_response_idx = [int(len(item)*self.config.actor_rollout_ref.rollout.cut_keep_rate) for item in response_token_ids] 
+        cut_response = [response_token_ids[i][:idx] for i,idx in enumerate(cut_response_idx)]
+        outputs = self.processor.tokenizer.batch_decode(cut_response,skip_special_tokens=True)
+        # raw_prompts = gen_cut_batch.non_tensor_batch['full_prompts']
+        # cut_response = [p+r for p,r in zip(raw_prompts,outputs)]
+        # cut_response[0]是一个str
+        
+        cut_response = []
+        for message,output in zip(messages,outputs): # message是模板
+            message_template = message.copy()
+            message_template.append({
+                "role":"assistant",
+                "content":[{'type':'text','text':output}]
+            })
+            cut_response.append(self.processor.apply_chat_template(message_template,add_generation_prompt=True,tokenizer=False))
+        
+        # cut_response[0]:
+        
+
+        processed_row_dicts=[]
+        max_prompt_length = self.config.data.max_prompt_length
+        truncation = self.config.get("truncation","right") # 源代码中全是error
+        need_tools_kwargs = self.config.get("need_tools_kwargs", False)
+        iteration = 0
+        image_patch_size = self.config.get("image_patch_size", 14)
+        endoftext_token_id = int(151643)
+
+        for i in range(len(gen_cut_batch)):
+            
+            item = gen_cut_batch[i]
+            row_dict:dict = {}
+            multi_modal_data = {}
+            images = item.non_tensor_batch['multi_modal_data']['image']
+            noise_imgs = image_augment_from_PIL(images) #  
+            # noise_imgs = [process_image(image, image_patch_size=image_patch_size) for image in noise_imgs] # 处理并存储在images列表中
+            multi_modal_data["image"] = noise_imgs
+            augment_inputs = self.processor(
+                text = cut_response[i], images = noise_imgs, videos = None, return_tensors='pt'
+            )
+            input_ids = augment_inputs.pop("input_ids")
+            attention_mask = augment_inputs.pop("attention_mask")
+
+            if "second_per_grid_ts" in augment_inputs:
+                augment_inputs.pop("second_per_grid_ts")
+            row_dict["multi_modal_data"] = multi_modal_data
+            row_dict["multi_modal_inputs"] = dict(augment_inputs)
+            row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
+
+            
+            # 注意，我这块先用了truncation = 'right'试验一下
+            # 这块让input_ids全都炸了
+            
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_prompt_length,  # 匹配数据集max_prompt_length 这个没有引用到
+                pad_token_id=self.tokenizer.pad_token_id, # self.tokenizer.pad_toke_id = 151643
+                left_pad=True,  # 匹配数据集左填充规则
+                truncation='right'  # 匹配数据集截断策略（error/left/right/middle）
+            )
+
+
+            if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+            # qwen-vl mrope
+                if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                    from verl.models.transformers.qwen3_vl import get_rope_index
+                else:
+                    from verl.models.transformers.qwen2_vl import get_rope_index
+
+                vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids[0],
+                    image_grid_thw=augment_inputs.get("image_grid_thw"),
+                    video_grid_thw=augment_inputs.get("video_grid_thw"),
+                    second_per_grid_ts=augment_inputs.get("second_per_grid_ts"),
+                    attention_mask=attention_mask[0],
+                )  # (3, seq_length)
+                valid_mask = attention_mask[0].bool()
+                text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                position_ids = [torch.cat((text_position_ids, vision_position_ids), dim=0)]  # (1, 4, seq_length)
+            elif self.processor is not None and "Glm4vImageProcessor" in self.processor.image_processor.__class__.__name__:
+                from verl.models.transformers.glm4v import get_rope_index
+
+                vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids[0],
+                    image_grid_thw=augment_inputs.get("image_grid_thw"),
+                    video_grid_thw=augment_inputs.get("video_grid_thw"),
+                    attention_mask=attention_mask[0],
+                )  # (3, seq_length)
+                valid_mask = attention_mask[0].bool()
+                text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                position_ids = [torch.cat((text_position_ids, vision_position_ids), dim=0)]  # (1, 4, seq_length)
+            else:
+                position_ids = compute_position_id_with_mask(attention_mask)
+
+            
+            is_endoftext = (input_ids[0]== endoftext_token_id)
+            end_count = torch.sum(is_endoftext).item()
+            
+            
+            row_dict["input_ids"] = input_ids[0]
+            row_dict["attention_mask"] = attention_mask[0]
+            row_dict["position_ids"] = position_ids[0]
+
+            
+
+            raw_prompt_ids = self.tokenizer.encode(cut_response[i],add_special_tokens=False) # inputs格式错误
+            if len(raw_prompt_ids) > max_prompt_length: # max_prompt_length 没定义，self.truncation没定义
+                if truncation == "left":
+                    raw_prompt_ids = raw_prompt_ids[-max_prompt_length :]
+                elif truncation == "right":
+                    raw_prompt_ids = raw_prompt_ids[:max_prompt_length]
+                elif truncation == "middle":
+                    left_half = max_prompt_length // 2
+                    right_half = max_prompt_length - left_half
+                    raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+                elif truncation == "error":
+                    raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length}.")
+                
+            row_dict["raw_prompt_ids"] = raw_prompt_ids
+            if "extra_info" not in row_dict or row_dict["extra_info"] is None:
+                row_dict["extra_info"] = dict()
+            index = row_dict.get("extra_info", {}).get("index", 0)
+            tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
+            interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
+            
+            need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", need_tools_kwargs)
+            if need_tools_kwargs and not tools_kwargs:
+                logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
+            row_dict["index"] = index
+            row_dict["tools_kwargs"] = tools_kwargs
+            row_dict["interaction_kwargs"] = interaction_kwargs
+            processed_row_dicts.append(row_dict)
+            iteration += 1
+
+        # 本地实现list_of_dict_to_dict_of_list辅助逻辑（因未找到全局函数）
+        
+        # 将row_dict列表转换为DataProto格式
+        print("\n DEBUG:Iteration is {}\n".format(iteration))
+        batch_dict = default_collate_fn(processed_row_dicts)
+        return DataProto.from_single_dict(batch_dict)
+
+
+        
+            
 
     def fit(self):
         """
@@ -967,33 +1326,36 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        # breakpoint()
-
-        logger = Tracking(
+        logger = Tracking( # Tracking继承用于记录训练中的各种指标
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0
+        self.global_steps = 0 # global是全局都能看到的计数器，他对学习率调度，检查点管理等有重要用途
 
         # load checkpoint before doing anything
-        self._load_checkpoint()
+        self._load_checkpoint() # 没有ckpt就直接训练，有的话就加载ckpt
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        # 初始验证： 如果配置允许且存在验证奖励函数，则在训练开始前执行一次验证。
+        # ---------------------------
+        # -- 为了快我跳过了初始验证    ---
+        # ---------------------------- # 我在后面加了个and False
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True) and False:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                return
+                return # 如果val_only == True 的话，直接退出
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-            rollout_skip.wrap_generate_sequences()
+            rollout_skip.wrap_generate_sequences() 
+        # 跳过rollout步骤 包裹 Rollout： 这是一种调试或特殊模式，可以跳过实际的序列生成步骤，直接使用预先生成的或缓存的数据，以加速测试算法逻辑。
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1003,53 +1365,75 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        prev_step_profile = False
+        prev_step_profile = False #根据global设置判断是否要对下一个步骤进行性能分析
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
             if self.config.global_profiler.steps is not None
             else False
         )
         next_step_profile = False
-
+# --------  Part1:训练循环初始化与数据准备-----
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics = {}
-                timing_raw = {}
+                metrics = {} # 各种性能指标
+                timing_raw = {} # 计算各阶段的耗时
 
+                # 启动性能分析： 如果 curr_step_profile 为 True，则启动配置的性能分析工具（如 PyTorch Profiler, Nsight Systems 等）。
                 with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(
+                    self._start_profiling( # 用内置方法启动性能分析
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-
-                # add uid to batch
+                
+                batch: DataProto = DataProto.from_single_dict(batch_dict) # 将batch_dict转换为DataProto格式，便于后续的ray分布式训练
+                # raw_propmt[0]:'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Use a Pythagorean Triple to find x. You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \\boxed{}.<|im_end|>\n<|im_start|>assistant\n'
+                # before_message[0]:
+                '''
+                [{'content': [...], 'role': 'user'}]
+                content[0]有：[{'type': 'image'}, {'type': 'text', 'text': 'Use a Pythagorean Triple to find x. You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \\boxed{}.'}]
+                # 文本插入位置会有影响吗
+                content[1]有：[{'type': 'image'}, {'type': 'text', 'text': 'Find the perimeter of the triangle. Round to the nearest hundredth. You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in \\boxed{}.'}]
+                outputs[0]:'<think>\nThe right-angled triangle with legs of 14 and 48 is a 9-12-15 Pythagorean triple. We know that in a 9-12-15 right triangle, the hypotenuse (the side opposite the right angle) is 15. However, we observed the leg of 14, not 9. The correct Pythagorean triple that matches this will be scaled up similarly. Let\'s re-examine the similar triпы and the largest common factor to set our leg lengths correctly:\n<code>\n|  | <strong>Edge 1</strong> | <strong>Edge 2</strong>| <strong>Edge 3</strong>\n|---|---|---|---|\n| <strong>9</strong> | 9x | 12x | 15x |\n| <strong>12</strong> | 12x | 18x | 24x |\n| <strong>15</strong> | 15x | 20x | 25x |\n| <strong>6</strong> | 6x | 9x | 12x |\n| <strong>2</strong> | 2x | 3x | 5x |\n</code>\nOnly 2, 3, and 5 are prime and have no multiples in the given pairs. If scaled up, the smallest factor from here is likely 3 giving the right leg� 42. Another option (65) tried was suboptimal. Finally, the 3, 4, 5 triangle fits then this pair is known as the "Pythagorean Triple."\n</think>\n\\boxed{37}'
+                '''
+                # add uid to batch 为批次中的每一个样本生成唯一标识符 后续聚合和一致性检查
+                # dict_keys(['data_source', 'ability', 'reward_model', 'extra_info', 'multi_modal_data', 'multi_modal_inputs', 'raw_prompt_ids', 'index', 'tools_kwargs', 'interaction_kwargs'])
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
-
-                gen_batch = self._get_gen_batch(batch)
-
+                
+                multi_modal_data = batch.non_tensor_batch['multi_modal_data'] # 这个可能得像上面UID那样的？
+                # 还是应该用prompt_id去分组，因为每个prompt_id对应着一个原始的prompt，而不是每个response_id
+                
+                ## ⏰⏰ TODO：understand
+                gen_batch = self._get_gen_batch(batch) # 调用内部方法从batch中提取相关数据
+                # 他是一个数据容器，承载了准备用于序列生成的输入数据
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
+                gen_batch_output = gen_batch.repeat( # 重复几次的原因是我们每次rollout可能会生成G个响应，这个多个响应的操作就是通过repeat实现的
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-
-                is_last_step = self.global_steps >= self.total_training_steps
-                with marked_timer("step", timing_raw):
+                is_last_step = self.global_steps >= self.total_training_steps # 判断是否当前训练为最后一轮
+# --------  Part2:序列生成-----
+                '''
+                SCS对于一致性采样和加噪声的逻辑是
+                1.对于每个原始的prompt生成rollout_n个响应 
+                2.对于每个response 进行截断，并每个生成cut_num个响应， 将这些所有的轨迹合起来计算奖励（这里面要注意分组，因为cut_num对应着原始的propmt/response_id）
+                3.进行更新
+                '''
+                with marked_timer("step", timing_raw): # 这个marked_timer是个上下文管理器，这次是把step和gen过程的耗时记录
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
+                        else: # 异步模式下用这个
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        timing_raw.update(gen_batch_output.meta_info["timing"]) # 字典信息更新
+                        gen_batch_output.meta_info.pop("timing", None) # 从gen_batch_output的meta_info中弹出timing字段，更新到timing_raw中
+                    ## ⏰⏰ TODO：understand（但是应该不用，我们是GRPO）
+                    # REMAX 是一种特殊的优势估计方法，它通过比较 实际采样序列的奖励 与 当前策略下贪婪生成的最优序列的奖励 来计算优势。
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX: # 如果是这个的话会额外跑一次贪心生成以得到基线轨迹
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -1078,114 +1462,208 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
+                    # gen_batch_output.batch.keys():_StringKeys(dict_keys(['input_ids', 'responses', 'position_ids', 'attention_mask', 'prompts']))
+                    # gen_batch_output.non_tensor_batch.keys():dict_keys(['ability', 'multi_modal_inputs', 'before_message', 'index', 'full_prompts', 'interaction_kwargs', 'tools_kwargs'])
+                
+                    # batch.non_tensor_batch的keys ['data_source', 'reward_model', 'extra_info', 'uid']
+                    batch.non_tensor_batch['multi_modal_data'] = multi_modal_data
+                    # batch.non_tensor_batch:dict_keys(['data_source', 'reward_model', 'extra_info', 'uid'])
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
-
-                    if "response_mask" not in batch.batch.keys():
+                    # rollout.n条response对应的uid是相同的
+                    batch = batch.union(gen_batch_output) # batch生成完毕   
+                    assert 'uid' in batch.non_tensor_batch, "uid is in the non_tensor_batch"
+                    # gen_batch_output.non_tensor_batch.keys():dict_keys(['interaction_kwargs', 'index', 'ability', 'multi_modal_inputs', 'tools_kwargs']) 
+# --------  Part3.1 Cut_Response 的生成
+                    # 这个batch的长度是batchsize*rollout
+                    # 这块缺少截断逻辑：先截断在散开，先把cut_batch中的prompt和response分别提取出来，然后截断
+                    # 先截断再生成_get_gen_batch
+                    cut_batch = deepcopy(batch)
+                    
+                    cut_batch = self._truncate_batch(cut_batch) 
+                    # 这里就已经出现了endoftext
+                    gen_cut_batch = self._get_gen_batch(cut_batch)
+                    
+                    gen_cut_batch.meta_info["global_steps"] = self.global_steps
+                    gen_cut_batch_output = gen_cut_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True
+                    ) # actor_rollout_cut_num是需要往config中添加的内容，需要更改config的内容 
+                    
+                    is_last_step = self.global_steps >= self.total_training_steps # 这个和上面原始rollout生成重复了，需要判断他的逻辑是否有问题
+                    with marked_timer("step_cut",timing_raw):
+                        with marked_timer("gen_cut",timing_raw,color="blue"):
+                            if not self.async_rollout_mode:
+                                gen_cut_batch_output = self.actor_rollout_wg.generate_sequences(gen_cut_batch_output)
+                            else:
+                                gen_cut_batch_output = self.async_rollout_manager.generate_sequences(gen_cut_batch_output)
+                            timing_raw.update(gen_cut_batch_output.meta_info["timing"])
+                            gen_cut_batch_output.meta_info.pop("timing", None) # 从gen_batch_output的meta_info中弹出timing字段，更新到timing_raw中
+                    
+                    
+                    cut_batch = cut_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True)
+                    cut_batch = cut_batch.union(gen_cut_batch_output) # 已经带有response
+                    # assert 'uid' in cut_batch.non_tensor_batch, "uid is in the cut:non_tensor_batch"
+                    # 目前 TODO：1.合并的逻辑还没有写 ✅ 2.如何找到cut_response对应的分组 3.rewardmanager的逻辑更改
+                    # 在SCS原版的论文代码中，response和cut_response是分开存储的；所以还要了解DataProto的储存原理以及dict是如何转化成DataProto进行训练的
+                    # 如果都是按照顺序存储且原始response和cut_response分开存储的话，那其实可以对于第i个原始response，就可以是[i*cut_num,(i+1)*cut_num]将对应的cut_response取出来
+                    # 如果这样的话，其实在rewardm                                                                                                                                                             anager里面更改逻辑就好了
+# --------  Part3:批次均衡与全局 token 计数-----
+                    if "response_mask" not in batch.batch.keys(): # response_mask是标记恢复中哪些是响应的内容
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
+
+                    if self.config.trainer.balance_batch: # 批次平衡
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
+                    '''
+                    利用AttentionMask计算全局有效token,例如，假设我们有三个句子：
+                    1. "Hello world" (2 tokens)
+                    2. "How are you?" (3 tokens)
+                    3. "I am fine, thank you." (5 tokens)
+                    如果我们将它们组成一个批次，并填充到最长序列的长度（5 tokens），可能会变成这样：
+                    1. "Hello world [PAD] [PAD] [PAD]"
+                    2. "How are you? [PAD] [PAD]"
+                    3. "I am fine, thank you."
+                    这里的 [PAD] 就是填充的 Token。
+                    attention_mask 的作用：为了让模型知道哪些是真实的 Token，哪些是填充的 Token，我们通常会使用一个 attention_mask 。
+                    - attention_mask 是一个与输入序列长度相同的二进制张量。
+                    - 对于真实的 Token， attention_mask 的值为 1 。
+                    - 对于填充的 Token， attention_mask 的值为 0 。
+                    以上面的例子为例，对应的 attention_mask 可能如下
+                    1. [1, 1, 0, 0, 0] 2. [1, 1, 1, 0, 0] 3. [1, 1, 1, 1, 1]
+                    '''
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+# -------- Part3.2 Cut_Response 的生成
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
+# --------  Part4:奖励计算与模型更新-----
+                    # 奖励阶段
+                    with marked_timer("reward", timing_raw, color="yellow"): # 记录奖励信息
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        if self.use_rm and "rm_scores" not in batch.batch.keys(): # 如果使用了奖励模型 ( self.use_rm ) 且 batch 中还没有奖励模型分数 奖励模型指的是ORM PRM那一类
+                            reward_tensor = self.rm_wg.compute_rm_score(batch) # 对这个批次进行打分
                             batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async: # 异步计算
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn) # 将各个来源的奖励组合
+                            # 其中reward_ten是tensor类型，extra是字典类型，和奖励有关的额外的信息
 
-                    from verl.trainer.ppo.rollout_corr_helper import (
-                        compute_rollout_correction_and_add_to_batch,
-                        maybe_apply_rollout_correction,
-                    )
-
+                    # Operating Mode Selection:
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # 旧策略和熵指标？
+# --------  Part5:旧策略对数概率计算与熵指标-----
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    need_recomputation = maybe_apply_rollout_correction(
-                        batch=batch,
-                        rollout_corr_config=rollout_corr_config,
-                        policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                    )
-                    if need_recomputation:
-                        # LEGACY MODE: Compute old_log_probs from actor
+                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    # PPO的思想就是通过限制新策略和就策略之间的差异防止策略更新过快，导致训练不稳定
+
+                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+                        '''
+                        使用 rollout_log_probs : 在这种模式下，代码的注释明确指出 # Use rollout_log_probs``。
+                        这意味着 old_log_probs 不会通过 self.actor_rollout_wg.compute_log_prob(batch) 重新计算。
+                        相反，它会直接使用在数据收集（rollout）阶段就已经计算并存储在 batch 中的 rollout_log_probs 。
+                        他的意思就直接在前向传播的过程中顺道给算了，就不用再重新调用一次forward计算了
+                        '''
+                        apply_rollout_correction(
+                            batch=batch,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                        )
+                    else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            # PPO的标准做法就是利用当前的actor模型计算所有动作的对数概率
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch) # 计算旧策略的对数概率
+                            # 熵可能会用到损失函数中
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(
+                            entropy_agg = agg_loss( # 将单个时间步/token的损失熵组合成一个单一的用于梯度计算的损失值，不同的聚合方式会影响到损失更新的方向
                                 loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
                             )
                             old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
+                            metrics.update(old_log_prob_metrics) # 更新
+                            old_log_prob.batch.pop("entropys") # 熵已经被更新到metric了，不需要存储了
+                            batch = batch.union(old_log_prob) # 将新计算出来的old_log_prob更新到batch中保证后续可以收到并使用数据
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}' # 保证old_log_prob防止后续计算出错
+# --------  Part6:参考策略与Critic计算-----
+                    # 什么是用reference_policy：防止我们的策略和原有策略不要相差太大
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
+                            if not self.ref_in_actor:# 如果不集成在actor中，这可能需要加载和维护两个独立的模型（Actor 和 Reference），从而 增加内存占用和计算资源 。但它提供了更大的灵活性，例如参考策略可以是完全不同的架构，或者可以独立于 Actor 进行更新（例如，保持冻结）。
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
+                            else: # 这通常通过在 Actor 模型中添加一个额外的输出头或共享大部分底层权重来实现。这种方式可以 节省内存和计算资源 ，因为只需要加载和运行一个模型。
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self.critic_wg.compute_values(batch) # 计算value
                             batch = batch.union(values)
-
+# --------  Part7:优势计算与策略更新-----
+                    # 奖励的最后处理阶段
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        batch.batch["token_level_scores"] = reward_tensor # 之前由compute_reward_fn计算得到的奖励张量
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
+                        if self.config.algorithm.use_kl_in_reward: # 是否应用KL散度
+                            # ⏰⏰
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
+                            )  
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        '''
+                        我们希望能够知道序列中 每个决策（即生成每个 Token）的好坏 。如果每个 Token 的奖励都相同，那么
+                        - 它本质上就退化成了序列级别的奖励，只是被广播到了每个 Token。
+                        - 策略很难区分序列中哪些 Token 的生成是好的，哪些是差的，从而难以进行有效的学习和改进。
+                        '''
 
-                        # Compute rollout correction weights centrally (once per batch)
-                        # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
-                        # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
-                        if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if ( # 旁路模式决定了到底需不需要重新计算一遍old_log_probs
+                            rollout_corr_config is not None # Rollout 修正是在旁路模式下，为了 弥补直接使用 rollout_log_probs 可能带来的不准确性 而引入的机制。即使我们直接使用了数据收集阶段的 rollout_log_probs ，这些值可能与当前训练策略所需的“旧策略”对数概率存在差异
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                            # Compute IS weights, apply rejection sampling, compute metrics
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
+                            "norm_adv_by_std_in_grpo", True # 获取GRPO归一化的一些参数
                         )  # GRPO adv normalization factor
 
+                        # 使用自己的配置计算优势
+                        # ⏰⏰ 计算优势
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1199,25 +1677,31 @@ class RayPPOTrainer:
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            # 更新critic
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+## ----- 用计算完的优势和reward更新actor和critic
+                    # implement critic warmup 训练开始的时候先只更新critic模型而保持actor模型不变（得保证价值估计要稳定一点）
+                    if self.config.trainer.critic_warmup <= self.global_steps: # 如果评论家的预热步数已经达到了，才能更新actor
                         # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
+                        with marked_timer("update_actor", timing_raw, color="red"): # 先让critic稳定下来再更新actor
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # 更新actor
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"]) # 抽取Actor模型的指标并用reduce_metrics进行聚合
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
+                        # 记录第一轮rollout
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        cut_rollout_dir = '/data1/yyy25/verl/cut_rollout'
+                        self._cut_log_rollout_data(batch=cut_batch,rollout_data_dir=cut_rollout_dir)
 
-                # validate
+
+                # validate #
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
@@ -1228,7 +1712,7 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
+# --------  Part8:检查点保存-----
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
@@ -1248,7 +1732,12 @@ class RayPPOTrainer:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
-
+                    '''
+                    - 这通常是指云服务提供商（如 AWS EC2 Spot Instances、Google Cloud Preemptible VMs 或阿里云抢占式实例）提供的 可中断的、成本较低的计算实例 。这些实例的价格通常远低于按需实例，但云提供商保留随时回收这些实例的权利，通常会提前几分钟（例如，AWS Spot Instance 会提前 2 分钟）发出通知。
+            - close_to_expiration ：当云提供商发出实例即将被回收的通知时，这个状态就会变为 True 。
+            为什么在训练脚本中会关注这个状态？ 在机器学习训练，特别是长时间运行的训练任务中，为了降低成本，研究人员和工程师经常会使用这些抢占式实例。然而，实例被回收意味着训练任务可能会中断，导致已完成的工作丢失。
+'''
+# --------  Part9:性能分析停止与计时更新-----
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
@@ -1266,6 +1755,7 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
+# part10 指标收集记录
                 # training metrics
                 metrics.update(
                     {

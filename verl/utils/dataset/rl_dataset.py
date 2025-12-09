@@ -108,7 +108,8 @@ class RLHFDataset(Dataset):
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
-        self.return_full_prompt = config.get("return_full_prompt", False)
+        # self.return_full_prompt = config.get("return_full_prompt", False)
+        self.return_full_prompt = True
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
@@ -297,7 +298,7 @@ class RLHFDataset(Dataset):
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
-
+            row_dict['before_message'] = messages
             raw_prompt = self.processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
             )
@@ -311,6 +312,7 @@ class RLHFDataset(Dataset):
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["image"] = images
+                # len(images) = 1
 
             videos = None
             videos_kwargs = {}
