@@ -65,7 +65,8 @@ from verl.workers.reward_manager import batch
 
 from verl.utils.add_noise import image_augment_from_PIL
 from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-from verl.utils.data_processor import DATA_PROCESSOR_MAP
+from verl.utils.group import group_id_dict
+
 
 
 @dataclass
@@ -498,8 +499,8 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -532,7 +533,7 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         
-        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=False)
+        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
         outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
 
         # 2. 准备文件路径
@@ -582,7 +583,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto: # 从原始批次中获取用于生成（generation）的批次数据
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "uuid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1042,120 +1043,7 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-    def _truncate_batch_before(self, gen_cut_batch: DataProto):# 传入的gen_cut_batch形状是batch_size*rollout_n
-        import verl.utils.torch_functional as verl_F
-        from verl.utils import hf_processor
-        # from verl.utils.dataset.vision_utils import process_image
-        data_processor = hf_processor(self.local_path, trust_remote_code=self.trust_remote_code, use_fast=True)
-
-        prompt_token_ids = gen_cut_batch.batch["input_ids"] # gen_cut_batch.batch.size()=([1024]) gen.batch是个字典
-        # batch的key['attention_mask', 'responses', 'position_ids', 'prompts', 'input_ids']
-        # "inputs_ids是标识符" prompts才是用于生成的
-        response_token_ids = gen_cut_batch.batch["responses"]
-        # attention_mask = gen_cut_batch.batch["attention_mask"] # 恢复attention_mask引用
-        inputs = data_processor.tokenizer.batch_decode(prompt_token_ids, skip_special_tokens=True)
-        
-        cut_response_idx = [int(len(item) * self.config.actor_rollout_ref.rollout.cut_keep_rate) for item in response_token_ids]
-        # cut_response_idx = int(len(response_token_ids) * self.config.actor_rollout_ref.rollout.cut_keep_rate)  # 修正整数转换
-        for idx in cut_response_idx:
-            cut_response = response_token_ids[:, :idx]
-        outputs = data_processor.tokenizer.batch_decode(cut_response, skip_special_tokens=True) 
-        inputs = [p+r for p,r in zip(inputs,outputs)]
-        
-        
-
-        '''
-        那所以prompt和response我应该从DataProto中的batch解码获得，
-        剩下的从non_tensor_Dict中获得，然后重新进行一遍处理和后处理的步骤是吗
-        '''
-        # 现在image,prompt,attentionmask等都需要重新处理并用类似的逻辑变回from_dict的形式
-        
-        # 我应该将这个batch按照RLHF的逻辑处理成一个batch，然后再用from_single_dict进行加载
-        processed_row_dicts=[]
-        max_prompt_length = self.config.data.max_prompt_length
-        truncation = self.config.get("truncation","right") # 源代码中全是error
-        need_tools_kwargs = self.config.get("need_tools_kwargs", False)
-        iteration = 0
-        image_patch_size = self.config.get("image_patch_size", 14)
-
-
-        for i in range(len(gen_cut_batch)):#1024
-            item = gen_cut_batch[i]
-            row_dict:dict = {} # item.batch['input_ids'].size:torch.Size([768])
-            multi_modal_data = {} # 
-            original_images = item.non_tensor_batch['multi_modal_data']['image'] # non_tensor_batch的keys ['data_source', 'reward_model', 'extra_info', 'uid', 'index', 'interaction_kwargs', 'tools_kwargs', 'ability', 'multi_modal_inputs']
-            noise_imgs = image_augment_from_PIL(original_images) #  
-            # noise_imgs = [process_image(image, image_patch_size=image_patch_size) for image in noise_imgs] # 处理并存储在images列表中
-            multi_modal_data["image"] = noise_imgs # 直接用original_images也是错了
-
-            augment_inputs = data_processor(
-                text=[inputs[i]],images=noise_imgs,videos=None,return_tensors="pt"
-            )
-            # todo1:按照scs的processor外面初始化封装传进来（全新的）
-            # todo2:用vllm直接加载
-            input_ids = augment_inputs.pop("input_ids")
-            attention_mask = augment_inputs.pop("attention_mask")
-
-            if "second_per_grid_ts" in augment_inputs:
-                augment_inputs.pop("second_per_grid_ts")
-            row_dict["multi_modal_data"] = multi_modal_data
-            row_dict["multi_modal_inputs"] = dict(augment_inputs)
-            row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
-
-            
-            # 注意，我这块先用了truncation = 'right'试验一下
-            input_ids, attention_mask = verl_F.postprocess_data(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_prompt_length,  # 匹配数据集max_prompt_length 这个没有引用到
-                pad_token_id=self.tokenizer.pad_token_id,
-                left_pad=True,  # 匹配数据集左填充规则
-                truncation='right'  # 匹配数据集截断策略（error/left/right/middle）
-            )
-
-            position_ids = compute_position_id_with_mask(attention_mask)
-
-            row_dict["input_ids"] = input_ids[0]
-            row_dict["attention_mask"] = attention_mask[0]
-            row_dict["position_ids"] = position_ids[0]
-
-            
-
-            raw_prompt_ids = self.tokenizer.encode(inputs[i],add_special_tokens=False) # inputs格式错误
-            if len(raw_prompt_ids) > max_prompt_length: # max_prompt_length 没定义，self.truncation没定义
-                if truncation == "left":
-                    raw_prompt_ids = raw_prompt_ids[-max_prompt_length :]
-                elif truncation == "right":
-                    raw_prompt_ids = raw_prompt_ids[:max_prompt_length]
-                elif truncation == "middle":
-                    left_half = max_prompt_length // 2
-                    right_half = max_prompt_length - left_half
-                    raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-                elif truncation == "error":
-                    raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length}.")
-                
-            row_dict["raw_prompt_ids"] = raw_prompt_ids
-            if "extra_info" not in row_dict or row_dict["extra_info"] is None:
-                row_dict["extra_info"] = dict()
-            index = row_dict.get("extra_info", {}).get("index", 0)
-            tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
-            interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
-            
-            need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", need_tools_kwargs)
-            if need_tools_kwargs and not tools_kwargs:
-                logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
-            row_dict["index"] = index
-            row_dict["tools_kwargs"] = tools_kwargs
-            row_dict["interaction_kwargs"] = interaction_kwargs
-            processed_row_dicts.append(row_dict)
-            iteration += 1
-
-        # 本地实现list_of_dict_to_dict_of_list辅助逻辑（因未找到全局函数）
-        
-        # 将row_dict列表转换为DataProto格式
-        print("\n DEBUG:Iteration is {}\n".format(iteration))
-        batch_dict = default_collate_fn(processed_row_dicts)
-        return DataProto.from_single_dict(batch_dict)
+    
     def _truncate_batch(self,gen_cut_batch:DataProto):
         
         import verl.utils.torch_functional as verl_F    
@@ -1344,7 +1232,7 @@ class RayPPOTrainer:
         # ---------------------------
         # -- 为了快我跳过了初始验证    ---
         # ---------------------------- # 我在后面加了个and False
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True) and False:
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1477,10 +1365,17 @@ class RayPPOTrainer:
                     # 这个batch的长度是batchsize*rollout
                     # 这块缺少截断逻辑：先截断在散开，先把cut_batch中的prompt和response分别提取出来，然后截断
                     # 先截断再生成_get_gen_batch
+                    tag_uid = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                        ) 
+                    batch.non_tensor_batch['tag_uid'] = tag_uid
                     cut_batch = deepcopy(batch)
                     
-                    cut_batch = self._truncate_batch(cut_batch) 
-                    # 这里就已经出现了endoftext
+                    cut_batch = self._truncate_batch(cut_batch)
+                    cut_batch.non_tensor_batch['tag_uid'] = tag_uid
+                    # ----- uid赋予 --------
+                    
+                    # ----- 赋予了每一个（包括rollout.n的独特的uid）----
                     gen_cut_batch = self._get_gen_batch(cut_batch)
                     
                     gen_cut_batch.meta_info["global_steps"] = self.global_steps
@@ -1501,7 +1396,9 @@ class RayPPOTrainer:
                     
                     cut_batch = cut_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True)
                     cut_batch = cut_batch.union(gen_cut_batch_output) # 已经带有response
-                    # assert 'uid' in cut_batch.non_tensor_batch, "uid is in the cut:non_tensor_batch"
+                   
+                    cut_batch_for_reward = group_id_dict(cut_batch, self.processor) # 返回的是一个dict为{'uid':[A,B,C]'}
+                    assert 'tag_uid' in cut_batch.non_tensor_batch, "uuid is in the cut:non_tensor_batch"
                     # 目前 TODO：1.合并的逻辑还没有写 ✅ 2.如何找到cut_response对应的分组 3.rewardmanager的逻辑更改
                     # 在SCS原版的论文代码中，response和cut_response是分开存储的；所以还要了解DataProto的储存原理以及dict是如何转化成DataProto进行训练的
                     # 如果都是按照顺序存储且原始response和cut_response分开存储的话，那其实可以对于第i个原始response，就可以是[i*cut_num,(i+1)*cut_num]将对应的cut_response取出来
@@ -1536,7 +1433,7 @@ class RayPPOTrainer:
                     1. [1, 1, 0, 0, 0] 2. [1, 1, 1, 0, 0] 3. [1, 1, 1, 1, 1]
                     '''
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-# -------- Part3.2 Cut_Response 的生成
+
 
 # --------  Part4:奖励计算与模型更新-----
                     # 奖励阶段
@@ -1551,7 +1448,7 @@ class RayPPOTrainer:
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn) # 将各个来源的奖励组合
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, cut_batch_for_reward, self.reward_fn) # 将各个来源的奖励组合
                             # 其中reward_ten是tensor类型，extra是字典类型，和奖励有关的额外的信息
 
                     # Operating Mode Selection:

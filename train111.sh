@@ -37,14 +37,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.cut_n=3 \
-    actor_rollout_ref.rollout.cut_keep_rate=0.8 \
+    actor_rollout_ref.rollout.cut_keep_rate=0.7 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='verl_grpo_example_geo3k' \
-    trainer.experiment_name='Debug_Majority_Qwen25_3b' \
+    trainer.project_name='CUT_Batch_Qwen25' \
+    trainer.experiment_name='Debug_CUT_Qwen25_3b' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

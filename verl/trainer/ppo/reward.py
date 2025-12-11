@@ -135,6 +135,7 @@ def load_reward_manager(
     print("\n-------\n Before:RewardManagerName:{name}\n-------\n".format(name=reward_manager_name))
     config.reward_model.reward_manager = "majority"
     reward_manager_name = config.reward_model.get("reward_manager", "majority")
+    reward_manager_name = "trunc"
     print("\n-------\n After:RewardManagerName:{name}\n-------\n".format(name=reward_manager_name))
     reward_manager_cls = get_reward_manager_cls(reward_manager_name)
 
@@ -168,7 +169,7 @@ def load_reward_manager(
 
 
 @tqbridge(put_data=False)
-def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
+def compute_reward(data: DataProto, cut_batch: dict, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute reward for a batch of data.
     Args:
@@ -178,12 +179,13 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
         Tuple of reward tensor and extra info dictionary.
     """
     try:
-        reward_result = reward_fn(data, return_dict=True)
+        reward_result = reward_fn(data, cut_batch, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
+        
         print(f"Error in reward_fn: {e}")
-        reward_tensor = reward_fn(data)
+        reward_tensor = reward_fn(data, cut_batch)
         reward_extra_infos_dict = {}
 
     return reward_tensor, reward_extra_infos_dict
