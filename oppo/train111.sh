@@ -43,8 +43,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='CUT_Batch_Qwen25' \
-    trainer.experiment_name='Debug_CUT_Qwen25_3b' \
+    trainer.project_name='8A800_CUT_Batch_Qwen25' \
+    trainer.experiment_name='Training_CUT_Qwen25_3b' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
