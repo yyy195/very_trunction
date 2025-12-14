@@ -533,7 +533,7 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         
-        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+        inputs = self.tokenizer.batch_decode(batch.batch["input_ids"], skip_special_tokens=True)
         outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
 
         # 2. 准备文件路径
@@ -583,7 +583,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto: # 从原始批次中获取用于生成（generation）的批次数据
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "uuid"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1045,16 +1045,30 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
     
     def _truncate_batch(self,gen_cut_batch:DataProto):
-        
+        # 现在传进来的是一个cut_n倍的batch，每个样本都被重复了cut_n次
         import verl.utils.torch_functional as verl_F    
 
         messages = gen_cut_batch.non_tensor_batch['before_message']
-        '''
-        
-        '''
+        cut_sign = ['20','35','50','65','80']
+        len_cut_sign = len(cut_sign)
         response_token_ids = gen_cut_batch.batch['responses']
-        # 那不对啊，他们其实都被填充到一样的长度了
-        cut_response_idx = [int(len(item)*self.config.actor_rollout_ref.rollout.cut_keep_rate) for item in response_token_ids] 
+        # 截断这一块需要根据几个不同比例来截断
+        # 都是按顺序来的就没必要这么麻烦了
+        cut_n = self.config.actor_rollout_ref.rollout.cut_n
+        assert cut_n == len_cut_sign , f"cut_n({cut_n}) must be equal to len_cut_sign({len_cut_sign})"
+        cut_ratio_list = self.config.actor_rollout_ref.rollout.cut_ratio_list
+        '''
+        for i in range(origin_rollout):
+            group_cut = gen_cut_batch[i*cut_n:(i+1)*cut_n]
+            response_token_ids = gen_cut_batch[i*cut_n].batch['responses']
+            response_len = len(response_token_ids)
+            cut_response_idx.append([
+                int(response_len * ratio) for ratio in cut_ratio_list
+            ])
+        '''
+        cut_response_idx = [
+            int(len(item) * cut_ratio_list[i % len_cut_sign]) for i,item in enumerate(response_token_ids)
+            ] 
         cut_response = [response_token_ids[i][:idx] for i,idx in enumerate(cut_response_idx)]
         outputs = self.processor.tokenizer.batch_decode(cut_response,skip_special_tokens=True)
         # raw_prompts = gen_cut_batch.non_tensor_batch['full_prompts']
@@ -1189,16 +1203,21 @@ class RayPPOTrainer:
             row_dict["index"] = index
             row_dict["tools_kwargs"] = tools_kwargs
             row_dict["interaction_kwargs"] = interaction_kwargs
+
+            # 如果按照排列顺序，是一定能够被cut_n整除的，所以一定可以按照顺序赋予截断符号
+            row_dict["cut_sign"] = cut_sign[i % len_cut_sign]
+
+
             processed_row_dicts.append(row_dict)
             iteration += 1
 
+        
         # 本地实现list_of_dict_to_dict_of_list辅助逻辑（因未找到全局函数）
         
         # 将row_dict列表转换为DataProto格式
         print("\n DEBUG:Iteration is {}\n".format(iteration))
         batch_dict = default_collate_fn(processed_row_dicts)
         return DataProto.from_single_dict(batch_dict)
-
 
         
             
@@ -1232,7 +1251,7 @@ class RayPPOTrainer:
         # ---------------------------
         # -- 为了快我跳过了初始验证    ---
         # ---------------------------- # 我在后面加了个and False
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True) :
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1365,23 +1384,32 @@ class RayPPOTrainer:
                     # 这个batch的长度是batchsize*rollout
                     # 这块缺少截断逻辑：先截断在散开，先把cut_batch中的prompt和response分别提取出来，然后截断
                     # 先截断再生成_get_gen_batch
+                    '''
                     tag_uid = np.array(
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                         ) 
-                    batch.non_tensor_batch['tag_uid'] = tag_uid
+                    '''
+                    # batch.non_tensor_batch['tag_uid'] = tag_uid
                     cut_batch = deepcopy(batch)
-                    
-                    cut_batch = self._truncate_batch(cut_batch)
-                    cut_batch.non_tensor_batch['tag_uid'] = tag_uid
-                    # ----- uid赋予 --------
-                    
-                    # ----- 赋予了每一个（包括rollout.n的独特的uid）----
-                    gen_cut_batch = self._get_gen_batch(cut_batch)
-                    
-                    gen_cut_batch.meta_info["global_steps"] = self.global_steps
-                    gen_cut_batch_output = gen_cut_batch.repeat(
+                    # cut_batch.non_tensor_batch['tag_uid'] = tag_uid
+                    cut_batch.meta_info["global_steps"] = self.global_steps
+                    cut_batch = cut_batch.repeat(
                         repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True
-                    ) # actor_rollout_cut_num是需要往config中添加的内容，需要更改config的内容 
+                        )
+                    
+                    uid = cut_batch.non_tensor_batch['uid']
+                    cut_batch = self._truncate_batch(cut_batch)
+                    cut_batch.non_tensor_batch['uid'] = uid
+                    # 至此为止还可以访问32/33
+                    # ----- uid赋予 --------
+                    # 先repeat，然后拼接
+                    # ----- 赋予了每一个（包括rollout.n的独特的uid）----
+                    gen_cut_batch_output = self._get_gen_batch(cut_batch)
+                    
+                    
+                    #gen_cut_batch_output = gen_cut_batch.repeat(
+                    #    repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True
+                    #) # actor_rollout_cut_num是需要往config中添加的内容，需要更改config的内容 
                     
                     is_last_step = self.global_steps >= self.total_training_steps # 这个和上面原始rollout生成重复了，需要判断他的逻辑是否有问题
                     with marked_timer("step_cut",timing_raw):
@@ -1393,16 +1421,11 @@ class RayPPOTrainer:
                             timing_raw.update(gen_cut_batch_output.meta_info["timing"])
                             gen_cut_batch_output.meta_info.pop("timing", None) # 从gen_batch_output的meta_info中弹出timing字段，更新到timing_raw中
                     
-                    
-                    cut_batch = cut_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True)
+                    # cut_batch = cut_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.cut_n, interleave=True)
                     cut_batch = cut_batch.union(gen_cut_batch_output) # 已经带有response
-                   
                     cut_batch_for_reward = group_id_dict(cut_batch, self.processor) # 返回的是一个dict为{'uid':[A,B,C]'}
-                    assert 'tag_uid' in cut_batch.non_tensor_batch, "uuid is in the cut:non_tensor_batch"
-                    # 目前 TODO：1.合并的逻辑还没有写 ✅ 2.如何找到cut_response对应的分组 3.rewardmanager的逻辑更改
-                    # 在SCS原版的论文代码中，response和cut_response是分开存储的；所以还要了解DataProto的储存原理以及dict是如何转化成DataProto进行训练的
-                    # 如果都是按照顺序存储且原始response和cut_response分开存储的话，那其实可以对于第i个原始response，就可以是[i*cut_num,(i+1)*cut_num]将对应的cut_response取出来
-                    # 如果这样的话，其实在rewardm                                                                                                                                                             anager里面更改逻辑就好了
+                    assert 'uid' in cut_batch.non_tensor_batch, "uuid is in the cut:non_tensor_batch"
+                    # 到这还是按顺序的                                                                                                                                                          anager里面更改逻辑就好了
 # --------  Part3:批次均衡与全局 token 计数-----
                     if "response_mask" not in batch.batch.keys(): # response_mask是标记恢复中哪些是响应的内容
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1410,7 +1433,8 @@ class RayPPOTrainer:
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
-
+                    
+                    self.config.trainer.balance_batch = False
                     if self.config.trainer.balance_batch: # 批次平衡
                         self._balance_batch(batch, metrics=metrics)
 
@@ -1594,8 +1618,9 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         # 记录第一轮rollout
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-                        cut_rollout_dir = '/data1/yyy25/verl/cut_rollout'
-                        self._cut_log_rollout_data(batch=cut_batch,rollout_data_dir=cut_rollout_dir)
+                        cut_rollout_dir = self.config.trainer.get("cut_data_dir",None)
+                        if cut_rollout_dir:
+                            self._cut_log_rollout_data(batch=cut_batch,rollout_data_dir=cut_rollout_dir)
 
 
                 # validate #

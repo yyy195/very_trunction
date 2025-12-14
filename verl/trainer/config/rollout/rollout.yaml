@@ -105,7 +105,7 @@ n: 1
 cut_n: 3
 
 # truncation-rate
-cut_keep_rate: 0.7
+cut_ratio_list: [0.2, 0.35, 0.5, 0.65, 0.8]
 
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,
 # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.

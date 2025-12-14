@@ -146,6 +146,9 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: /data1/yyy25/verl/verl_valida
 
+  # Look through trunction new rollouts
+  cut_data_dir: /data1/yyy25/verl/cut_rollout
+
   # Number of nodes used in the training
   nnodes: 1
 

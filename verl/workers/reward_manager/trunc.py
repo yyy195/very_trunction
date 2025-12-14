@@ -3,6 +3,8 @@ from typing import Any
 
 import torch
 import re
+import math
+from collections import Counter
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -57,6 +59,76 @@ def compute_score_majority(predict_str: str, ground_truth: str, cut_answer_set:l
 
 
 
+def max_infoentro_increase(answer_dict:dict) -> tuple[float, Any, dict, dict]:
+    max_entropy = 0.0
+    max_entropy_cut_sign = None
+    all_cut_sign_counts = Counter()
+    max_entropy_specific_counts = Counter() # 新增：存储最大熵对应的cut_sign的答案计数
+
+    for cut_sign, answer_list in answer_dict.items():
+        counts = Counter(answer_list)
+        all_cut_sign_counts.update(counts)
+
+        total_elements = len(answer_list)
+        if total_elements == 0:
+            continue
+
+        entropy = 0.0
+        for count in counts.values():
+            probability = count / total_elements
+            if probability > 0:
+                entropy -= probability * math.log2(probability)
+        
+        if entropy > max_entropy:
+            max_entropy = entropy
+            max_entropy_cut_sign = cut_sign
+            max_entropy_specific_counts = counts # 更新为当前cut_sign的计数
+            
+    return max_entropy, max_entropy_cut_sign, dict(all_cut_sign_counts), dict(max_entropy_specific_counts)
+
+
+def calculate_adjusted_reward(
+    current_trajectory_answer: Any,
+    all_cut_sign_counts_dict: dict,
+    max_cut_sign_specific_counts_dict: dict,
+    total_all_answers: int, # 新增参数
+    boost_factor: float = 0.2, # 提升因子
+    penalty_factor: float = 0.1 # 惩罚因子
+) -> float:
+    """计算调整后的奖励。"""
+
+    # 1. 计算基础频率奖励
+    if total_all_answers == 0:
+        base_frequency = 0.0
+    else:
+        base_frequency = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / total_all_answers
+    
+    base_reward = base_frequency # 基础奖励可以简单地等于这个频率
+
+    # 2. 根据max_cut_sign进行调整
+    final_reward = base_reward
+
+    total_max_cut_sign_answers = sum(max_cut_sign_specific_counts_dict.values())
+    if total_max_cut_sign_answers > 0:
+        max_cut_sign_frequency = max_cut_sign_specific_counts_dict.get(current_trajectory_answer, 0) / total_max_cut_sign_answers
+    else:
+        max_cut_sign_frequency = 0.0
+
+    # 调整逻辑
+    if max_cut_sign_frequency == 0 and base_frequency > 0:
+        # 情况1: 答案在整体中存在，但在max_cut_sign中不存在。
+        # 这可能表明这是一个“难以找到”的答案，因此我们提升奖励。
+        final_reward += base_reward * boost_factor
+    elif max_cut_sign_frequency > base_frequency and base_frequency > 0:
+        # 情况2: 答案在max_cut_sign中的频率高于整体频率。提升奖励。
+        final_reward += base_reward * boost_factor
+    elif max_cut_sign_frequency < base_frequency and max_cut_sign_frequency > 0:
+        # 情况3: 答案在max_cut_sign中的频率低于整体频率。降低奖励。
+        final_reward -= base_reward * penalty_factor
+    
+    # 确保奖励在合理范围 [0, 1]
+    return max(0.0, min(1.0, final_reward))
+
 
 
 
@@ -98,7 +170,7 @@ class TruncRewardManager(AbstractRewardManager):
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
-        already_print_data_sources = {}
+        uid_list = []
         per_pro_rollout_n = self.rollout_n
         answers_box = []
         valid_length_box = []
@@ -112,6 +184,8 @@ class TruncRewardManager(AbstractRewardManager):
             data_item = data[i]  # DataProtoItem
 
             prompt_ids = data_item.batch["prompts"]
+            uid = data_item.non_tensor_batch["uid"]
+            
 
             prompt_length = prompt_ids.shape[-1]
 
@@ -147,24 +221,59 @@ class TruncRewardManager(AbstractRewardManager):
                 response_content.append(response_str)
                 answers_box.append(response_in_box)
                 valid_length_box.append(valid_response_length)
+                uid_list.append(uid) # 加入到uid列表中
         
         # 处理cut_batch
 
         # 以下是Majority投票议程
-
         if self.flag == True:
             # 训练阶段
             # 我知道了！如果所有的都没有提取出答案，那么answer_box都会是None，然后多数投票投出来的就是None，如果再提取出来的也是None，这个score就是1了
             
             original_batch = len(data) // per_pro_rollout_n
             majority_answer = []
-            for i in range(original_batch): # 用于算单纯的答案的
+            '''
+            for i in range(original_batch): # 这是多数投票的逻辑
                 group_answers = answers_box[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n]
-                group_counter = Counter(group_answers)
+                # -----
+                group_counter = Counter(group_answers) #
                 group_majority = group_counter.most_common(1)[0][0] # most_common(1)只会返回最多的元素和对应的次数[('A',5)]
-                majority_answer.extend([group_majority] * per_pro_rollout_n)
+                majority_answer.extend([group_majority] * per_pro_rollout_n) # 多数处理的后处理
+                # -----
+            '''
+            for i in range(original_batch): 
+                # {'uid': {'cut_sign': [对应答案列表]}}
+                group_answers = answers_box[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n] # group_answers是uid相同的rollout.n条的answer
+                valid_response_group = valid_length_box[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n]
+                uid_rollout = uid_list[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n]
+                uid = uid_rollout[0]    
+                for item in uid_rollout: # 保证这一组里面的uid都是相等的
+                    assert item == uid, f"uid({uid}) is not equal to item({item})"
+                # cut_batch是这样的结构：{'uid': {'cut_sign': [对应答案列表]}}
+                cut_batch_statistic = cut_batch[uid] # cut_batch_statistics是对应uid的子字典 
+                # 本身就算没有截断
+                # 接下来要计算最大信息增益，统计辅助集合中不同答案的数量
+                info_entropy, max_cut_sign, all_cut_sign_counts_dict, max_cut_sign_specific_counts_dict = max_infoentro_increase(cut_batch_statistic)         
+                
+                total_all_answers = sum(all_cut_sign_counts_dict.values())
 
-           
+                # 为当前uid对应的所有轨迹计算奖励
+                for j in range(per_pro_rollout_n):
+                    current_trajectory_index = i * per_pro_rollout_n + j
+                    current_trajectory_answer = answers_box[current_trajectory_index]
+                    valid_response_length = valid_length_box[current_trajectory_index]
+
+                    # 还没有算格式奖励那些
+                    freq_score = calculate_adjusted_reward(
+                        current_trajectory_answer,
+                        all_cut_sign_counts_dict,
+                        max_cut_sign_specific_counts_dict,
+                        total_all_answers
+                    ) 
+                    format_score = format_reward(response_content[current_trajectory_index])
+                    score = 0.9 * freq_score + 0.1 * format_score
+                    reward_tensor[current_trajectory_index, valid_response_length-1] = score
+            '''
             for i in range(len(data)):
                 tag_uid = data[i].non_tensor_batch["tag_uid"] # 当前轨迹的uid
                 valid_response_length = valid_length_box[i]
@@ -174,7 +283,7 @@ class TruncRewardManager(AbstractRewardManager):
                     
                     score = compute_score_majority(response_content[i],majority_answer[i],cut_batch[tag_uid]) # 这个计算的是原始output字符串，但是MM-UPT他是选择题
                 reward_tensor[i, valid_response_length-1] = score
-
+            '''
         # 到这里应该出现reward_tensor和reward_extra_info
         if return_dict:
             return {

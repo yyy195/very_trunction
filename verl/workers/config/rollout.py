@@ -180,7 +180,7 @@ class RolloutConfig(BaseConfig):
 
     cut_n: Optional[int] = None
 
-    cut_keep_rate: Optional[float] = None
+    cut_ratio_list: list = None
 
     def __post_init__(self):
         """Validate the rollout config"""
