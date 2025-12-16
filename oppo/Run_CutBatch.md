@@ -35,9 +35,13 @@ export CUDA_VISIBLE_DEVICES=3,2
 ## 命令行增加内容
 **原来的这些内容配置在config中的绝对路径，现在将他们用命令行显式化**
 `ray_kwargs.ray_init._temp_dir=/data1/yyy25/ray_tmp`用途： 指定 Ray 框架的临时目录。
+
 `trainer.validation_data_dir=/data1/yyy25/verl/verl_valida`用途： 指定验证数据的存储目录。
+
 `trainer.rollout_data_dir=/data1/yyy25/verl/verl_rollout`用途： 指定 Rollout 数据的存储目录。
-`trainer.cut_data_dir=/data1/yyy25/verl/cut_rollout`用途： 指定 CUT (Curriculum Training?) 机制相关数据的存储目录。
+
+`trainer.cut_data_dir=/data1/yyy25/verl/cut_rollout`用途： 指定 CUT  机制相关数据的存储目录。
+
 `actor_rollout_ref.rollout.cut_n=5`用途： 控制 CUT 机制相关的 Rollout 样本数。
 ## 参数增加和代码变化
 1.新增`cut_ratio_list=[0.2,0.35,0.5,0.65,0.8]`五个截断位置
@@ -46,3 +50,10 @@ export CUDA_VISIBLE_DEVICES=3,2
 - 情况1: 答案在整体中存在，但在 max_cut_sign 中不存在。这可能表明这是一个“难以找到”的答案，因此我们提升奖励。`if max_cut_sign_frequency == 0 and base_frequency > 0: final_reward += base_reward * boost_factor`
 - 情况2: 答案在 max_cut_sign 中的频率高于整体频率。这表明该答案在信息增益最大的截断点处表现良好，因此我们提升奖励。`elif max_cut_sign_frequency > base_frequency and base_frequency > 0: final_reward += base_reward * boost_factor`
 - 情况3: 答案在 max_cut_sign 中的频率低于整体频率。这表明该答案在信息增益最大的截断点处表现不佳，因此我们降低奖励。`elif max_cut_sign_frequency < base_frequency and max_cut_sign_frequency > 0: final_reward -= base_reward * penalty_factor`
+
+# Version2.1
+## 命令行变化内容
+1.删除了rollout输出的文件夹，并于主循环中将输出设置为`False`，加快一丢丢训练速度。
+2.将`tensor_parallel_size`变为`1`，意在解决可能发生的内存泄漏和`rayOOM`问题
+3.`_balance_batch`在`version2.0`版本中因为reward计算需要顺序删除，在现版本调整了位置而恢复，增加GPU利用率
+4.**8A_train.sh**为新的训练脚本，更改内容如上，可直接应用

@@ -2,14 +2,14 @@ set -x
 ENGINE=${1:-vllm}
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=3,2
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     ray_kwargs.ray_init._temp_dir=/data1/yyy25/ray_tmp \
     data.train_files=/data1/yyy25/datasets/geo3k/train.parquet \
     data.val_files=/data1/yyy25/datasets/geo3k/test.parquet \
-    data.train_batch_size=8 \
+    data.train_batch_size=4 \
     data.max_prompt_length=256 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
