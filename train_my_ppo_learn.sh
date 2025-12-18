@@ -2,14 +2,14 @@ set -x
 ENGINE=${1:-vllm}
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=3,2
+export CUDA_VISIBLE_DEVICES=3
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     ray_kwargs.ray_init._temp_dir=/data1/yyy25/ray_tmp \
     data.train_files=/data1/yyy25/datasets/geo3k/train.parquet \
     data.val_files=/data1/yyy25/datasets/geo3k/test.parquet \
-    data.train_batch_size=4 \
+    data.train_batch_size=2 \
     data.max_prompt_length=256 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
@@ -19,7 +19,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.rollout_data_dir=/data1/yyy25/verl/verl_rollout \
     trainer.cut_data_dir=/data1/yyy25/verl/cut_rollout \
     actor_rollout_ref.model.path=/data1/yyy25/datasets/Qwen2.5-VL-3B-Instruct \
-    actor_rollout_ref.actor.optim.lr=5e-8 \
+    actor_rollout_ref.actor.optim.lr=1e-8 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=2 \

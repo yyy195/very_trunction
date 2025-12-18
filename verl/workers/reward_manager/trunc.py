@@ -129,6 +129,9 @@ def calculate_adjusted_reward(
     # 确保奖励在合理范围 [0, 1]
     return max(0.0, min(1.0, final_reward))
 
+import torch
+import math
+
 
 
 
@@ -154,6 +157,176 @@ class TruncRewardManager(AbstractRewardManager):
         self.cut_num = cut_num
         self.flag = flag
         self.val_rollout_n = val_rollout_n
+
+    def calculate_sscr_reward(self, cut_batch_statistic: dict, group_answers: list, all_cut_sign_counts_dict: dict, total_all_answers: int, n: int = 8, lam: float = 0.2) -> torch.Tensor:
+        """
+        根据时序 Beta 平滑计算自洽性奖励函数 (SSCR)（整合 cut_batch 处理逻辑）。
+
+        Args:
+            cut_batch_statistic: 对应单个uid的截断数据字典，键为截断点标识，值为8条分支答案列表
+            group_answers: 当前组rollout.n条母轨迹的最终答案列表
+            all_cut_sign_counts_dict: 包含所有采样结果（rollout+截断分支）的答案计数字典
+            total_all_answers: 所有采样结果的总数量
+            n: 每个截断点的采样数 (n_j)。默认为 8。
+            lam: 时序平滑系数 (lambda)。默认为 0.2。
+
+        Returns:
+            形状为 (rollout.n,) 的 Tensor，作为 GRPO 的 Reward 信号。
+        """
+        # 新增：从cut_batch_statistic生成k_matrix
+        sorted_cut_signs = sorted(cut_batch_statistic.keys(), key=lambda x: int(x))
+        assert len(sorted_cut_signs) == 5, f"预期5个截断点，实际获取{len(sorted_cut_signs)}个"
+        k_matrix = []
+        for a_i in group_answers:
+            k_vals = []
+            for cut_sign in sorted_cut_signs:
+                k = sum(1 for ans in cut_batch_statistic[cut_sign] if ans == a_i)
+                k_vals.append(k)
+            k_matrix.append(k_vals)
+        k_matrix = torch.tensor(k_matrix, dtype=torch.float32)
+
+        # 新增：计算global_freqs
+        global_freqs = torch.tensor([
+            all_cut_sign_counts_dict.get(a_i, 0) / total_all_answers
+            for a_i in group_answers
+        ], dtype=torch.float32)
+
+        # 保留原SSCR核心逻辑
+        batch_size = k_matrix.shape[0]
+        num_cut_points = k_matrix.shape[1]  # 预期为 5
+
+        # 确保输入 Tensor 的数据类型为浮点型，以支持后续的数学运算
+        k_matrix = k_matrix.to(torch.float32)
+        global_freqs = global_freqs.to(torch.float32)
+
+        # Step 1: 计算每个截断点的独立得分 (Score_i,j)
+        scores = torch.zeros_like(k_matrix, dtype=torch.float32)
+
+        # 处理第一个截断点 (j=1, 对应 k_matrix 的第 0 列)
+        # 公式退化为标准拉普拉斯平滑：(k_i,1 + 1) / (n + 2)
+        scores[:, 0] = (k_matrix[:, 0] + 1) / (n + 2)
+
+        # 处理后续截断点 (j > 1, 对应 k_matrix 的第 1 到 4 列)
+        # Score_i,j = (k_i,j + (lambda * k_i,j-1 + 1)) / (n_j + (lambda * n_j-1 + 2))
+        # 由于 n_j = n_j-1 = n，分母简化为 n * (1 + lambda) + 2
+        denominator_j_gt_1 = n * (1 + lam) + 2
+
+        for j in range(1, num_cut_points):
+            k_curr = k_matrix[:, j]
+            k_prev = k_matrix[:, j - 1]
+            scores[:, j] = (k_curr + (lam * k_prev + 1)) / denominator_j_gt_1
+
+        # Step 2: 计算轨迹综合自洽分 (S_i)
+        # 使用 log 空间计算几何平均，以提高数值稳定性
+        # S_i = (∏ Score_i,j)^(1/5)
+        log_scores = torch.log(scores)
+        sum_log_scores = torch.sum(log_scores, dim=1)
+        S_i = torch.exp(sum_log_scores / num_cut_points)
+
+        # Step 3: 计算最终总奖励 (Reward_i)
+        # Reward_i = S_i * Global_Freq(a_i)
+        reward_i = S_i * global_freqs
+
+        # 对奖励进行 Min-Max 归一化到 [0, 1] 范围
+        min_reward = reward_i.min()
+        max_reward = reward_i.max()
+
+        if max_reward > min_reward:
+            reward_i = (reward_i - min_reward) / (max_reward - min_reward)
+        else: # max_reward == min_reward, meaning all rewards are identical
+            # 如果所有奖励值都相同，则将它们设置为 1.0，表示它们都是最高分。
+            reward_i = torch.ones_like(reward_i)
+        # 并且如果 min_reward 已经为 0 或 1，则不需要进一步处理
+
+        return reward_i
+
+    def calculate_lga_reward(
+        self,
+        cut_batch_statistic: dict,
+        group_answers: list,
+        all_cut_sign_counts_dict: dict, 
+        total_all_answers: int,
+        inconsistency_gamma=0.8,
+        var_eta=0.1,
+    ) -> torch.Tensor:
+        """
+        基于calculate_sscr_reward结构实现逻辑引力奖励函数 (LGA-Reward)
+        仅修改截断点得分计算逻辑并增加即时对齐修正W_j
+
+        Args:
+            cut_batch_statistic: 对应单个uid的截断数据字典（同SSCR）
+            group_answers: 当前组rollout.n条母轨迹的最终答案列表（同SSCR）
+            shadow_answers_for_group: 每条母轨迹在各截断点的影子答案列表
+            global_freqs: 每条母轨迹答案的全局频率Tensor
+            n: 每个截断点的采样数（同SSCR）
+
+        Returns:
+            形状为(rollout.n,)的Tensor（同SSCR）
+        """
+
+        global_freqs = torch.tensor([
+            all_cut_sign_counts_dict.get(a_i, 0) / total_all_answers
+            for a_i in group_answers
+        ], dtype=torch.float32)
+
+        # 复用SSCR的截断点排序逻辑
+        sorted_cut_signs = sorted(cut_batch_statistic.keys(), key=lambda x: int(x))
+        assert len(sorted_cut_signs) == 5, f"预期5个截断点，实际获取{len(sorted_cut_signs)}个"
+
+        # 替换SSCR的k_matrix计算为LGA的B_j（局部共识强度）计算
+        # 按截断点顺序处理，与SSCR轨迹顺序保持一致
+        num_trajectories = len(group_answers)
+        b_matrix = torch.zeros(num_trajectories, len(sorted_cut_signs), dtype=torch.float32)
+        consensus_answers = []
+
+        # 预计算每个截断点的共识答案（复用SSCR的批量处理逻辑）
+        for cut_sign in sorted_cut_signs:
+            all_answers = cut_batch_statistic[cut_sign]
+            answer_counts = Counter(all_answers)
+            consensus_answer = max(answer_counts, key=answer_counts.get) if answer_counts else None
+            consensus_answers.append(consensus_answer)
+
+        # 按轨迹顺序计算每个截断点的B_j和W_j（与SSCR轨迹遍历逻辑一致）
+        for i in range(num_trajectories):
+            for j, cut_sign in enumerate(sorted_cut_signs):
+                all_answers = cut_batch_statistic[cut_sign]
+                answer_counts = Counter(all_answers)
+                total = len(all_answers)
+
+                # 计算B_j（替换SSCR的得分计算）
+                if consensus_answers[j] is None:
+                    b_j = 0.01
+                else:
+                    alpha = answer_counts[consensus_answers[j]] + 1
+                    beta = (total - answer_counts[consensus_answers[j]]) + 1
+                    mu = alpha / (alpha + beta)
+                    sigma = torch.sqrt(torch.tensor((alpha * beta) / ((alpha + beta)**2 * (alpha + beta + 1)), dtype=torch.float32))
+                    b_j = mu - var_eta * sigma
+                    b_j = torch.clamp(torch.tensor(b_j, dtype=torch.float32), min=0.01)
+
+                # 增加W_j计算（额外步骤）
+                shadow_answer = cut_batch_statistic[cut_sign][i]
+                w_j = 1.0 if shadow_answer == consensus_answers[j] else inconsistency_gamma
+
+                # 综合得分（替换SSCR的单截断点得分）
+                b_matrix[i][j] = b_j * w_j
+
+        # 复用SSCR的几何平均聚合逻辑
+        log_scores = torch.log(b_matrix)
+        sum_log_scores = torch.sum(log_scores, dim=1)
+        P = torch.exp(sum_log_scores / len(sorted_cut_signs))
+
+        # 复用SSCR的全局频率修正和归一化逻辑
+        reward_i = P * global_freqs
+        min_reward = reward_i.min()
+        max_reward = reward_i.max()
+
+        if max_reward > min_reward:
+            reward_i = (reward_i - min_reward) / (max_reward - min_reward)
+        else:
+            reward_i = torch.ones_like(reward_i)
+
+        return reward_i
 
     def __call__(self, data: DataProto, cut_batch:dict,  return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -255,35 +428,41 @@ class TruncRewardManager(AbstractRewardManager):
                 # 接下来要计算最大信息增益，统计辅助集合中不同答案的数量
                 info_entropy, max_cut_sign, all_cut_sign_counts_dict, max_cut_sign_specific_counts_dict = max_infoentro_increase(cut_batch_statistic)         
                 
+                # 将原始rollout答案（group_answers）并入all_cut_sign_counts_dict
+                for answer in group_answers:
+                    all_cut_sign_counts_dict[answer] = all_cut_sign_counts_dict.get(answer, 0) + 1
+
                 total_all_answers = sum(all_cut_sign_counts_dict.values())
+
+                breakpoint()
+                # 调用SSCR奖励函数，现在它在内部处理k_matrix和global_freqs的构建
+                '''
+                sscr_rewards = self.calculate_lga_reward(
+                    cut_batch_statistic=cut_batch_statistic,
+                    group_answers=group_answers,
+                    all_cut_sign_counts_dict=all_cut_sign_counts_dict,
+                    total_all_answers=total_all_answers,
+                    n=self.rollout_n # 这里的n就是rollout.n，即每个截断点派生出的分支数
+                )
+                '''
+                sscr_rewards = self.calculate_lga_reward(
+                        group_answers=group_answers,
+                        cut_batch_statistic=cut_batch_statistic,
+                        all_cut_sign_counts_dict=all_cut_sign_counts_dict,
+                        total_all_answers=total_all_answers,
+                    )
 
                 # 为当前uid对应的所有轨迹计算奖励
                 for j in range(per_pro_rollout_n):
                     current_trajectory_index = i * per_pro_rollout_n + j
-                    current_trajectory_answer = answers_box[current_trajectory_index]
                     valid_response_length = valid_length_box[current_trajectory_index]
-
-                    # 还没有算格式奖励那些
-                    freq_score = calculate_adjusted_reward(
-                        current_trajectory_answer,
-                        all_cut_sign_counts_dict,
-                        max_cut_sign_specific_counts_dict,
-                        total_all_answers
-                    ) 
+                    # 保留格式奖励作为辅助约束
                     format_score = format_reward(response_content[current_trajectory_index])
-                    score = 0.9 * freq_score + 0.1 * format_score
+                    # 最终奖励 = SSCR奖励 * (1 + 格式奖励的加权影响)
+                    # 这里的0.1是格式奖励的权重，可以根据实际效果调整
+                    score = sscr_rewards[j] * 0.9 + 0.1 * format_score  
                     reward_tensor[current_trajectory_index, valid_response_length-1] = score
-            '''
-            for i in range(len(data)):
-                tag_uid = data[i].non_tensor_batch["tag_uid"] # 当前轨迹的uid
-                valid_response_length = valid_length_box[i]
-                if answers_box[i] == 'None': # 如果他不为None，那么Majority也必定有不为None的，所以就不为None
-                    score = 0.0
-                else: # 此时可以传入答案集合，因为其他的rollout都是辅助的 cut_batch[uid]是truction的答案辅助集合
-                    
-                    score = compute_score_majority(response_content[i],majority_answer[i],cut_batch[tag_uid]) # 这个计算的是原始output字符串，但是MM-UPT他是选择题
-                reward_tensor[i, valid_response_length-1] = score
-            '''
+            
         # 到这里应该出现reward_tensor和reward_extra_info
         if return_dict:
             return {
