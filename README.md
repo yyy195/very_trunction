@@ -1,10 +1,15 @@
 # 仓库各版本说明
 ## 分支说明
 1.`main`:最早的分支，在verl框架的基础上实现了无监督的多数投票。
+
 2.`verl_maj_cutbatch`:最早实现截断逻辑的版本，该版本的截断是按照固定`cut_keep_rate`截取拼接的。这一版本的`reward_manager`是`majority`
-3.`cut_majority_finish`:依然是固定`cut_keep_rate`截断，`reward_manager`更换为`trunc`，加入一致性奖励
-4.`distribution_trunc`:截断比例分为5点截断`[0.2,0.35,0.5,0.65,0.8]`，基础奖励变为**答案在总体截断答案+母轨迹答案中的频率**
-5.`distribution_trunc_01`:将4中的“频率基础答案”变为“多数投票01”，多数投票gt的获取是通过rollout_n条母轨迹获得，奖励构成为“准确性+一致性+格式”
+
+3.`cut_majority_finish`:依然是固定`cut_keep_rate`截断，`reward_manager`更换为`trunc`，加入一致性奖励。
+
+4.`distribution_trunc`:截断比例分为5点截断`[0.2,0.35,0.5,0.65,0.8]`，基础奖励变为**答案在总体截断答案+母轨迹答案中的频率**。
+
+5.`distribution_trunc_01`:将4中的“频率基础答案”变为“多数投票01”，多数投票gt的获取是通过rollout_n条母轨迹获得，奖励构成为“准确性+一致性+格式”。
+
 6.`beta_trunc`：将reward建模成“频率奖励+beta分布稳定性调整”
 
 
