@@ -195,7 +195,7 @@ class TruncRewardManager(AbstractRewardManager):
                     acc_score = acc_reward(response_str_for_current_trajectory, majority_answer_for_group)
 
                     # 组合奖励
-                    score = 0.5 * acc_score + 0.3 * consistency_score + 0.2 * format_score
+                    score = 0.7 * acc_score + 0.2 * consistency_score + 0.1 * format_score
                     reward_tensor[current_trajectory_index, valid_response_length-1] = score
             
         # 到这里应该出现reward_tensor和reward_extra_info
