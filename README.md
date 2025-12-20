@@ -12,6 +12,8 @@
 
 6.`beta_trunc`：将reward建模成“频率奖励+beta分布稳定性调整”
 
+7.`distribution_trunc_lnreward`:按照ln奖励将`distribution_trunc`的奖励数学化和统计化，具有解释性
+
 
 
 # Version1.0
