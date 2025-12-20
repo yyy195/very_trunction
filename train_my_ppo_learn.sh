@@ -6,7 +6,6 @@ export CUDA_VISIBLE_DEVICES=3
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    ray_kwargs.ray_init._temp_dir=/data1/yyy25/ray_tmp \
     data.train_files=/data1/yyy25/datasets/geo3k/train.parquet \
     data.val_files=/data1/yyy25/datasets/geo3k/test.parquet \
     data.train_batch_size=2 \
@@ -15,9 +14,6 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=images \
-    trainer.validation_data_dir=/data1/yyy25/verl/verl_valida \
-    trainer.rollout_data_dir=/data1/yyy25/verl/verl_rollout \
-    trainer.cut_data_dir=/data1/yyy25/verl/cut_rollout \
     actor_rollout_ref.model.path=/data1/yyy25/datasets/Qwen2.5-VL-3B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-8 \
     actor_rollout_ref.model.use_remove_padding=True \
