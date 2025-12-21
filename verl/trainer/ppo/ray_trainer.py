@@ -1411,8 +1411,7 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
 
-                    if self.config.trainer.balance_batch: # 批次平衡
-                        self._balance_batch(batch, metrics=metrics)
+                    
 
                     # compute global_valid tokens
                     '''
@@ -1451,6 +1450,8 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, cut_batch_for_reward, self.reward_fn) # 将各个来源的奖励组合
                             # 其中reward_ten是tensor类型，extra是字典类型，和奖励有关的额外的信息
 
+                    if self.config.trainer.balance_batch: # 批次平衡
+                        self._balance_batch(batch, metrics=metrics)
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
