@@ -6,6 +6,8 @@ import re
 import math
 from collections import Counter
 import time
+import os
+import csv
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -129,16 +131,11 @@ def calculate_adjusted_reward(
     return max(0.0, min(1.0, final_reward))
 
 
-
-
-    
-
-
 @register("trunc")
 class TruncRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1, entropy_log_path="/data1/yyy25/verl/entropy_log_file") -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1, entropy_log_path="/data1/yyy25/verl/entropy_log_file.csv") -> None:
     
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -150,14 +147,13 @@ class TruncRewardManager(AbstractRewardManager):
         self.val_rollout_n = val_rollout_n
         # New: Entropy monitoring configuration
         self.entropy_log_path = entropy_log_path
-        self.truncation_entropy_history: List[Dict] = []  # Store batch-wise entropy data
+        self.truncation_entropy_history: list[dict] = []  # Store batch-wise entropy data
         self.batch_count = 0  # Track batch number
         # New: Initialize log file if not exists
         self._init_entropy_log_file()
     def _init_entropy_log_file(self) -> None:
         """Initialize CSV log file for truncation point entropy"""
-        import os
-        import csv
+        
         if not os.path.exists(self.entropy_log_path):
             with open(self.entropy_log_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "cut_sign_0.2", "cut_sign_0.35", "cut_sign_0.5", "cut_sign_0.65", "cut_sign_0.8", "gt_in_cut_sign_0.2", "gt_in_cut_sign_0.35", "gt_in_cut_sign_0.5", "gt_in_cut_sign_0.65", "gt_in_cut_sign_0.8"])
@@ -283,23 +279,23 @@ class TruncRewardManager(AbstractRewardManager):
                 for cut_sign, answers in cut_batch_statistic.items():
                     gt_count = answers.count(ground_truth_box[i * per_pro_rollout_n]) # Use the ground truth for the current original prompt
                     gt_presence_in_cut_signs[cut_sign] = gt_count / len(answers) if len(answers) > 0 else 0.0
-
+                
                 # New: Accumulate entropy data to history
                 self.batch_count += 1
                 current_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 entropy_record = {
                     "batch_num": self.batch_count,
                     "timestamp": current_timestamp,
-                    "cut_sign_0.2": all_entropies.get(0.2, 0.0),
-                    "cut_sign_0.35": all_entropies.get(0.35, 0.0),
-                    "cut_sign_0.5": all_entropies.get(0.5, 0.0),
-                    "cut_sign_0.65": all_entropies.get(0.65, 0.0),
-                    "cut_sign_0.8": all_entropies.get(0.8, 0.0),
-                    "gt_in_cut_sign_0.2": gt_presence_in_cut_signs.get(0.2, 0.0),
-                    "gt_in_cut_sign_0.35": gt_presence_in_cut_signs.get(0.35, 0.0),
-                    "gt_in_cut_sign_0.5": gt_presence_in_cut_signs.get(0.5, 0.0),
-                    "gt_in_cut_sign_0.65": gt_presence_in_cut_signs.get(0.65, 0.0),
-                    "gt_in_cut_sign_0.8": gt_presence_in_cut_signs.get(0.8, 0.0),
+                    "cut_sign_0.2": all_entropies.get('20', 0.0),
+                    "cut_sign_0.35": all_entropies.get('35', 0.0),
+                    "cut_sign_0.5": all_entropies.get('50', 0.0),
+                    "cut_sign_0.65": all_entropies.get('65', 0.0),
+                    "cut_sign_0.8": all_entropies.get('80', 0.0),
+                    "gt_in_cut_sign_0.2": gt_presence_in_cut_signs.get('20', 0.0),
+                    "gt_in_cut_sign_0.35": gt_presence_in_cut_signs.get('35', 0.0),
+                    "gt_in_cut_sign_0.5": gt_presence_in_cut_signs.get('50', 0.0),
+                    "gt_in_cut_sign_0.65": gt_presence_in_cut_signs.get('65', 0.0),
+                    "gt_in_cut_sign_0.8": gt_presence_in_cut_signs.get('80', 0.0),
                 }
                 self.truncation_entropy_history.append(entropy_record)
 
