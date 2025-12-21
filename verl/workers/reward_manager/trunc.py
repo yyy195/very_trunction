@@ -434,7 +434,6 @@ class TruncRewardManager(AbstractRewardManager):
 
                 total_all_answers = sum(all_cut_sign_counts_dict.values())
 
-                breakpoint()
                 # 调用SSCR奖励函数，现在它在内部处理k_matrix和global_freqs的构建
                 '''
                 sscr_rewards = self.calculate_lga_reward(
