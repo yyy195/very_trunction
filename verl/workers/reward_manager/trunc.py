@@ -130,12 +130,44 @@ def calculate_adjusted_reward(
     # 确保奖励在合理范围 [0, 1]
     return max(0.0, min(1.0, final_reward))
 
+def calculate_signal_for_metrics(
+    current_trajectory_answer: Any,
+    all_cut_sign_counts_dict: dict,
+    max_cut_sign_specific_counts_dict: dict,
+    total_all_answers: int,
+    info_entropy: float, # 新增参数，用于熵权缩放
+    epsilon: float = 1e-9 # 新增参数，用于数值稳定性
+) -> float:
+    """计算用于指标记录的signal。"""
+
+    # 1. 计算基础频率 (P_total)
+    if total_all_answers == 0:
+        p_total = 0.0
+    else:
+        p_total = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / total_all_answers
+    
+    # 2. 计算最大熵频率 (P_max)
+    total_max_cut_sign_answers = sum(max_cut_sign_specific_counts_dict.values())
+    if total_max_cut_sign_answers == 0:
+        p_max = 0.0
+    else:
+        p_max = max_cut_sign_specific_counts_dict.get(current_trajectory_answer, 0) / total_max_cut_sign_answers
+
+    # 3. 计算置信度信号 (Signal)
+    # 确保 P_total 和 P_max 不为零，使用 epsilon 进行数值稳定性处理
+    if p_total + epsilon <= 0 or p_max + epsilon <= 0:
+        signal = 0.0
+    else:
+        signal = math.log((p_max + epsilon) / (p_total + epsilon)) * (1 + info_entropy)
+    
+    return signal
+
 
 @register("trunc")
 class TruncRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1, entropy_log_path="/data1/yyy25/verl/entropy_log_file.csv") -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1, entropy_log_path="./entropy_log_file.csv",metrics_log_path='./metrics_log_file.csv') -> None:
     
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -151,6 +183,11 @@ class TruncRewardManager(AbstractRewardManager):
         self.batch_count = 0  # Track batch number
         # New: Initialize log file if not exists
         self._init_entropy_log_file()
+
+        # New: Metrics monitoring configuration
+        self.metrics_log_path = metrics_log_path  # Path for the new metrics log file
+        self.metrics_history: list[dict] = []  # Store batch-wise metrics data
+        self._init_metrics_log_file()
     def _init_entropy_log_file(self) -> None:
         """Initialize CSV log file for truncation point entropy"""
         
@@ -159,6 +196,13 @@ class TruncRewardManager(AbstractRewardManager):
                 writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "cut_sign_0.2", "cut_sign_0.35", "cut_sign_0.5", "cut_sign_0.65", "cut_sign_0.8", "gt_in_cut_sign_0.2", "gt_in_cut_sign_0.35", "gt_in_cut_sign_0.5", "gt_in_cut_sign_0.65", "gt_in_cut_sign_0.8"])
                 writer.writeheader()
                 
+    def _init_metrics_log_file(self) -> None:
+        """Initialize CSV log file for new metrics"""
+        if not os.path.exists(self.metrics_log_path):
+            with open(self.metrics_log_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "gt_base_frequency", "gt_max_entropy_frequency", "signal", "base_frequency_per_trajectory", "max_entropy_frequency_per_trajectory", "current_trajectory_answer", "ground_truth"])
+                writer.writeheader()
+
     def save_entropy_history(self) -> None:
         """Save accumulated truncation point entropy history to CSV"""
         if not self.truncation_entropy_history:
@@ -169,6 +213,15 @@ class TruncRewardManager(AbstractRewardManager):
             writer.writerows(self.truncation_entropy_history)
         # Clear history after saving to avoid duplicate writing
         self.truncation_entropy_history.clear()
+
+    def save_metrics_history(self) -> None:
+        """Save accumulated metrics history to CSV"""
+        if not self.metrics_history:
+            return
+        with open(self.metrics_log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "gt_base_frequency", "gt_max_entropy_frequency", "signal", "base_frequency_per_trajectory", "max_entropy_frequency_per_trajectory", "current_trajectory_answer", "ground_truth"])
+            writer.writerows(self.metrics_history)
+        self.metrics_history.clear()
 
     def __call__(self, data: DataProto, cut_batch:dict,  return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -302,11 +355,46 @@ class TruncRewardManager(AbstractRewardManager):
                 # New: Save to CSV after each batch (adjust frequency as needed)
                 self.save_entropy_history()
 
-                # 为当前uid对应的所有轨迹计算奖励
+                # New: Calculate and record new metrics
+                # Calculate prompt-level ground truth frequencies once per prompt
+                prompt_ground_truth = ground_truth_box[i * per_pro_rollout_n]
+                gt_base_frequency = all_cut_sign_counts_dict.get(prompt_ground_truth, 0) / total_all_answers if total_all_answers > 0 else 0.0
+                # 母轨迹gt答案在全部答案中的占比
+                total_max_cut_sign_answers = sum(max_cut_sign_specific_counts_dict.values())
+                gt_max_entropy_frequency = max_cut_sign_specific_counts_dict.get(prompt_ground_truth, 0) / total_max_cut_sign_answers if total_max_cut_sign_answers > 0 else 0.0
+                # 母轨迹gt答案在最大熵集合中的占比
                 for j in range(per_pro_rollout_n):
                     current_trajectory_index = i * per_pro_rollout_n + j
                     current_trajectory_answer = answers_box[current_trajectory_index]
                     valid_response_length = valid_length_box[current_trajectory_index]
+
+                    # Calculate trajectory-specific metrics
+                    gt_base_frequency_per_trajectory = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / total_all_answers if total_all_answers > 0 else 0.0
+                    # 当前母轨迹答案占全部答案的频率
+                    gt_max_entropy_frequency_per_trajectory = max_cut_sign_specific_counts_dict.get(current_trajectory_answer, 0) / total_max_cut_sign_answers if total_max_cut_sign_answers > 0 else 0.0
+                    # 当前母轨迹答案占最大熵集合
+                    # Calculate signal using the new calculate_signal_for_metrics function
+                    signal = calculate_signal_for_metrics(
+                        current_trajectory_answer=current_trajectory_answer,
+                        all_cut_sign_counts_dict=all_cut_sign_counts_dict,
+                        max_cut_sign_specific_counts_dict=max_cut_sign_specific_counts_dict,
+                        total_all_answers=total_all_answers,
+                        info_entropy=info_entropy # Pass info_entropy here
+                    )
+
+                    metrics_record = {
+                        "batch_num": self.batch_count,
+                        "timestamp": current_timestamp,
+                        "gt_base_frequency": gt_base_frequency, # Prompt-level
+                        "gt_max_entropy_frequency": gt_max_entropy_frequency, # Prompt-level
+                        "signal": signal, # Trajectory-level
+                        "base_frequency_per_trajectory": gt_base_frequency_per_trajectory, # Trajectory-level
+                        "max_entropy_frequency_per_trajectory": gt_max_entropy_frequency_per_trajectory, # Trajectory-level
+                        "current_trajectory_answer": current_trajectory_answer, # Trajectory-level
+                        "ground_truth": prompt_ground_truth, # Prompt-level
+                    }
+                    self.metrics_history.append(metrics_record)
+                    self.save_metrics_history()
 
                     # 还没有算格式奖励那些
                     freq_score = calculate_adjusted_reward(
@@ -318,17 +406,7 @@ class TruncRewardManager(AbstractRewardManager):
                     format_score = format_reward(response_content[current_trajectory_index])
                     score = 0.9 * freq_score + 0.1 * format_score
                     reward_tensor[current_trajectory_index, valid_response_length-1] = score
-            '''
-            for i in range(len(data)):
-                tag_uid = data[i].non_tensor_batch["tag_uid"] # 当前轨迹的uid
-                valid_response_length = valid_length_box[i]
-                if answers_box[i] == 'None': # 如果他不为None，那么Majority也必定有不为None的，所以就不为None
-                    score = 0.0
-                else: # 此时可以传入答案集合，因为其他的rollout都是辅助的 cut_batch[uid]是truction的答案辅助集合
-                    
-                    score = compute_score_majority(response_content[i],majority_answer[i],cut_batch[tag_uid]) # 这个计算的是原始output字符串，但是MM-UPT他是选择题
-                reward_tensor[i, valid_response_length-1] = score
-            '''
+            
         # 到这里应该出现reward_tensor和reward_extra_info
         if return_dict:
             return {
@@ -337,6 +415,4 @@ class TruncRewardManager(AbstractRewardManager):
             }
         else:
             return reward_tensor
-
-
 
