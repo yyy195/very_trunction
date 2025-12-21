@@ -5,6 +5,7 @@ import torch
 import re
 import math
 from collections import Counter
+import time
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -12,6 +13,7 @@ from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from mathruler.grader import extract_boxed_content, grade_answer
+
 
 
 def format_reward(predict_str: str) -> float:
@@ -59,32 +61,29 @@ def compute_score_majority(predict_str: str, ground_truth: str, cut_answer_set:l
 
 
 
-def max_infoentro_increase(answer_dict:dict) -> tuple[float, Any, dict, dict]:
-    max_entropy = 0.0
-    max_entropy_cut_sign = None
-    all_cut_sign_counts = Counter()
-    max_entropy_specific_counts = Counter() # 新增：存储最大熵对应的cut_sign的答案计数
-
-    for cut_sign, answer_list in answer_dict.items():
-        counts = Counter(answer_list)
-        all_cut_sign_counts.update(counts)
-
-        total_elements = len(answer_list)
-        if total_elements == 0:
-            continue
-
-        entropy = 0.0
-        for count in counts.values():
-            probability = count / total_elements
-            if probability > 0:
-                entropy -= probability * math.log2(probability)
-        
+def max_infoentro_increase(answer_dict: dict) -> tuple[float, Any, dict, dict, dict]:
+    max_entropy = -1.0
+    max_cut_sign = None
+    all_counts = defaultdict(int)
+    max_counts = defaultdict(int)
+    all_entropies = {}  # New: Store entropy for each cut_sign
+    for cut_sign, answers in answer_dict.items():
+        # Calculate entropy for current cut_sign
+        counts = Counter(answers)
+        total = sum(counts.values())
+        entropy = sum(-(cnt/total)*math.log2(cnt/total) for cnt in counts.values()) if total > 0 else 0.0
+        all_entropies[cut_sign] = entropy  # New: Record current cut_sign's entropy
+        # Update max entropy info
         if entropy > max_entropy:
             max_entropy = entropy
-            max_entropy_cut_sign = cut_sign
-            max_entropy_specific_counts = counts # 更新为当前cut_sign的计数
-            
-    return max_entropy, max_entropy_cut_sign, dict(all_cut_sign_counts), dict(max_entropy_specific_counts)
+            max_cut_sign = cut_sign
+            max_counts = counts.copy()
+        # Accumulate all counts
+        for ans, cnt in counts.items():
+            all_counts[ans] += cnt
+    # New: Add all_entropies to return value
+    return max_entropy, max_cut_sign, dict(all_counts), dict(max_counts), all_entropies
+
 
 
 def calculate_adjusted_reward(
@@ -132,20 +131,15 @@ def calculate_adjusted_reward(
 
 
 
+    
+
+
 @register("trunc")
 class TruncRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1) -> None:
-        
-        '''
-        ToDo1:传进来的数据形式最简单粗暴的就是batch:DataProto 和 cut_batch:DataProto
-        ToDo2:如何确定标识符，原文给予的uid对于rollout_n是唯一的，但是对于cut_batch来说，uid是重复的，所以可能需要以相同的方法再生成uid
-        ToDo3:需要写分类函数，将prompt和截断的response分在一组计算奖励
-        -------
-        1.其实我们只需要cut_batch的uid和responses就可以了，uid用于分组，responses用于计算奖励
-        2.cut_batch在外面整理好再传输进来，要整理成一个TensorDict的形式{'uid':'response'}，uid是要重新分配的，response
-        '''
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", rollout_n=2, flag=True, cut_num=3, val_rollout_n=1, entropy_log_path="/data1/yyy25/verl/entropy_log_file") -> None:
+    
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
@@ -154,6 +148,31 @@ class TruncRewardManager(AbstractRewardManager):
         self.cut_num = cut_num
         self.flag = flag
         self.val_rollout_n = val_rollout_n
+        # New: Entropy monitoring configuration
+        self.entropy_log_path = entropy_log_path
+        self.truncation_entropy_history: List[Dict] = []  # Store batch-wise entropy data
+        self.batch_count = 0  # Track batch number
+        # New: Initialize log file if not exists
+        self._init_entropy_log_file()
+    def _init_entropy_log_file(self) -> None:
+        """Initialize CSV log file for truncation point entropy"""
+        import os
+        import csv
+        if not os.path.exists(self.entropy_log_path):
+            with open(self.entropy_log_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "cut_sign_0.2", "cut_sign_0.35", "cut_sign_0.5", "cut_sign_0.65", "cut_sign_0.8", "gt_in_cut_sign_0.2", "gt_in_cut_sign_0.35", "gt_in_cut_sign_0.5", "gt_in_cut_sign_0.65", "gt_in_cut_sign_0.8"])
+                writer.writeheader()
+                
+    def save_entropy_history(self) -> None:
+        """Save accumulated truncation point entropy history to CSV"""
+        if not self.truncation_entropy_history:
+            return
+        # Append new records to CSV
+        with open(self.entropy_log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["batch_num", "timestamp", "cut_sign_0.2", "cut_sign_0.35", "cut_sign_0.5", "cut_sign_0.65", "cut_sign_0.8", "gt_in_cut_sign_0.2", "gt_in_cut_sign_0.35", "gt_in_cut_sign_0.5", "gt_in_cut_sign_0.65", "gt_in_cut_sign_0.8"])
+            writer.writerows(self.truncation_entropy_history)
+        # Clear history after saving to avoid duplicate writing
+        self.truncation_entropy_history.clear()
 
     def __call__(self, data: DataProto, cut_batch:dict,  return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -175,7 +194,7 @@ class TruncRewardManager(AbstractRewardManager):
         answers_box = []
         valid_length_box = []
         response_content = []
-        
+        ground_truth_box = [] # New: Initialize list to store ground truths
 
         assert per_pro_rollout_n > 1, "If you use MajorityVotes, Rollout_n should be greater than 1"
 
@@ -217,11 +236,13 @@ class TruncRewardManager(AbstractRewardManager):
                 reward_tensor[i, valid_response_length-1] = score
 
             else:
+                ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
                 response_in_box = extract_boxed_content(response_str)
                 response_content.append(response_str)
                 answers_box.append(response_in_box)
                 valid_length_box.append(valid_response_length)
                 uid_list.append(uid) # 加入到uid列表中
+                ground_truth_box.append(ground_truth) # New: Store ground truth
         
         # 处理cut_batch
 
@@ -253,9 +274,37 @@ class TruncRewardManager(AbstractRewardManager):
                 cut_batch_statistic = cut_batch[uid] # cut_batch_statistics是对应uid的子字典 
                 # 本身就算没有截断
                 # 接下来要计算最大信息增益，统计辅助集合中不同答案的数量
-                info_entropy, max_cut_sign, all_cut_sign_counts_dict, max_cut_sign_specific_counts_dict = max_infoentro_increase(cut_batch_statistic)         
+                info_entropy, max_cut_sign, all_cut_sign_counts_dict, max_cut_sign_specific_counts_dict, all_entropies = max_infoentro_increase(cut_batch_statistic)         
                 
                 total_all_answers = sum(all_cut_sign_counts_dict.values())
+
+                # Calculate ground truth presence in each cut_sign
+                gt_presence_in_cut_signs = {}
+                for cut_sign, answers in cut_batch_statistic.items():
+                    gt_count = answers.count(ground_truth_box[i * per_pro_rollout_n]) # Use the ground truth for the current original prompt
+                    gt_presence_in_cut_signs[cut_sign] = gt_count / len(answers) if len(answers) > 0 else 0.0
+
+                # New: Accumulate entropy data to history
+                self.batch_count += 1
+                current_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                entropy_record = {
+                    "batch_num": self.batch_count,
+                    "timestamp": current_timestamp,
+                    "cut_sign_0.2": all_entropies.get(0.2, 0.0),
+                    "cut_sign_0.35": all_entropies.get(0.35, 0.0),
+                    "cut_sign_0.5": all_entropies.get(0.5, 0.0),
+                    "cut_sign_0.65": all_entropies.get(0.65, 0.0),
+                    "cut_sign_0.8": all_entropies.get(0.8, 0.0),
+                    "gt_in_cut_sign_0.2": gt_presence_in_cut_signs.get(0.2, 0.0),
+                    "gt_in_cut_sign_0.35": gt_presence_in_cut_signs.get(0.35, 0.0),
+                    "gt_in_cut_sign_0.5": gt_presence_in_cut_signs.get(0.5, 0.0),
+                    "gt_in_cut_sign_0.65": gt_presence_in_cut_signs.get(0.65, 0.0),
+                    "gt_in_cut_sign_0.8": gt_presence_in_cut_signs.get(0.8, 0.0),
+                }
+                self.truncation_entropy_history.append(entropy_record)
+
+                # New: Save to CSV after each batch (adjust frequency as needed)
+                self.save_entropy_history()
 
                 # 为当前uid对应的所有轨迹计算奖励
                 for j in range(per_pro_rollout_n):
