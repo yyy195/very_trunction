@@ -36,6 +36,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.cut_n=5 \
+    actor_rollout_ref.rollout.cut_keep_rate=0.7 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \

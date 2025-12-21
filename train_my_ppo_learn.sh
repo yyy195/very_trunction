@@ -2,7 +2,7 @@ set -x
 ENGINE=${1:-vllm}
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=3,2
+export CUDA_VISIBLE_DEVICES=3
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
