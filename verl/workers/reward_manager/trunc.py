@@ -47,7 +47,6 @@ def calculate_adjusted_reward(
     penalty_factor: float = 0.1 # 惩罚因子
 ) -> float:
     """计算调整后的奖励。"""
-
     count = uid_set.count(current_trajectory_answer)
     # 1. 计算基础频率奖励
     if total_all_answers == 0:
@@ -181,7 +180,7 @@ class TruncRewardManager(AbstractRewardManager):
             data_item = data[i]  # DataProtoItem
 
             prompt_ids = data_item.batch["prompts"]
-            uid = data_item.non_tensor_batch['tag_uid']
+            
 
             prompt_length = prompt_ids.shape[-1]
 
@@ -213,6 +212,7 @@ class TruncRewardManager(AbstractRewardManager):
                 reward_tensor[i, valid_response_length-1] = score
 
             else:
+                uid = data_item.non_tensor_batch['tag_uid']
                 response_in_box = extract_boxed_content(response_str)
                 response_content.append(response_str)
                 answers_box.append(response_in_box)
@@ -235,15 +235,15 @@ class TruncRewardManager(AbstractRewardManager):
                 group_majority = group_counter.most_common(1)[0][0] # most_common(1)只会返回最多的元素和对应的次数[('A',5)]
                 majority_answer.extend([group_majority] * per_pro_rollout_n)
 
-            for i in range(original_batch):
-                uid_rollout = uid[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n]
-                uid_set = []
-                for _,value in uid_rollout.items():
-                    uid_set.extend(value)
+            for i in range(original_batch): # 正常来说应该是对于rollout.n条轨迹每个算自己的截断，但是因为我们要算频率，所以还需要进行合并操作
+                uid_rollout = uid_list[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n] # 这些是同一个prompt生成的
+                answer_set = []
+                for uid in uid_rollout:
+                    answer_set.extend(cut_batch[uid]) # 答案集合
 
                 # _, _, all_cut_sign_counts_dict, max_cut_sign_specific_counts_dict = max_infoentro_increase(cut_batch_statistic)         
                 
-                total_all_answers = len(uid_set)
+                total_all_answers = len(answer_set) + per_pro_rollout_n
                 for j in range(per_pro_rollout_n):
                     current_trajectory_index = i * per_pro_rollout_n + j
                     current_trajectory_answer = answers_box[current_trajectory_index]
@@ -251,7 +251,7 @@ class TruncRewardManager(AbstractRewardManager):
 
                     freq_score = calculate_adjusted_reward(
                         current_trajectory_answer,
-                        uid_set,
+                        answer_set,
                         total_all_answers,
                     ) 
                     format_score = format_reward(response_content[current_trajectory_index])
