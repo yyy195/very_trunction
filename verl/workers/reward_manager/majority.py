@@ -123,22 +123,30 @@ class MajorityRewardManager(AbstractRewardManager):
 
         if self.flag == True:
             # 训练阶段
-            # 我知道了！如果所有的都没有提取出答案，那么answer_box都会是None，然后多数投票投出来的就是None，如果再提取出来的也是None，这个score就是1了
-            
+            # 将奖励设置为当前答案在rollout_n条响应中的出现频率
             original_batch = len(data) // per_pro_rollout_n
-            majority_answer = []
-            for i in range(original_batch): # 用于算单纯的答案的
-                group_answers = answers_box[i * per_pro_rollout_n : (i + 1) * per_pro_rollout_n]
+            answer_frequencies = []  # 存储每个响应对应的答案出现频率
+            for i in range(original_batch):
+                group_start = i * per_pro_rollout_n
+                group_end = (i + 1) * per_pro_rollout_n
+                group_answers = answers_box[group_start:group_end]
                 group_counter = Counter(group_answers)
-                group_majority = group_counter.most_common(1)[0][0] # most_common(1)只会返回最多的元素和对应的次数[('A',5)]
-                majority_answer.extend([group_majority] * per_pro_rollout_n)
+                group_size = len(group_answers)
+                # 计算组内每个答案的频率并填充到answer_frequencies
+                group_frequencies = [group_counter[ans] / group_size for ans in group_answers]
+                answer_frequencies.extend(group_frequencies)
 
             for i in range(len(data)):
                 valid_response_length = valid_length_box[i]
-                if answers_box[i] == 'None': # 如果他不为None，那么Majority也必定有不为None的，所以就不为None
+                current_answer = answers_box[i]
+                if current_answer == 'None':
                     score = 0.0
                 else:
-                    score = compute_score_majority(response_content[i],majority_answer[i]) # 这个计算的是原始output字符串，但是MM-UPT他是选择题
+                    # 获取当前答案在组内的频率作为核心奖励
+                    freq_score = answer_frequencies[i]
+                    # 保留格式奖励作为补充（可根据需求调整权重比例）
+                    format_score_val = format_reward(response_content[i])
+                    score = 0.9 * freq_score + 0.1 * format_score_val
                 reward_tensor[i, valid_response_length-1] = score
 
         # 到这里应该出现reward_tensor和reward_extra_info
