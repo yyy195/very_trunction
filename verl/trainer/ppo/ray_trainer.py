@@ -1101,8 +1101,8 @@ class RayPPOTrainer:
             row_dict:dict = {}
             multi_modal_data = {}
             images = item.non_tensor_batch['multi_modal_data']['image']
-            noise_imgs = images
-            # noise_imgs = image_augment_from_PIL(images) #  
+            # noise_imgs = images
+            noise_imgs = image_augment_from_PIL(images) #  
             # noise_imgs = [process_image(image, image_patch_size=image_patch_size) for image in noise_imgs] # 处理并存储在images列表中
             multi_modal_data["image"] = noise_imgs
             augment_inputs = self.processor(
