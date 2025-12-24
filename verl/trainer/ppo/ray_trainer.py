@@ -1101,7 +1101,8 @@ class RayPPOTrainer:
             row_dict:dict = {}
             multi_modal_data = {}
             images = item.non_tensor_batch['multi_modal_data']['image']
-            noise_imgs = image_augment_from_PIL(images) #  
+            # noise_imgs = image_augment_from_PIL(images) # 
+            noise_imgs = images 
             # noise_imgs = [process_image(image, image_patch_size=image_patch_size) for image in noise_imgs] # 处理并存储在images列表中
             multi_modal_data["image"] = noise_imgs
             augment_inputs = self.processor(
@@ -1438,24 +1439,6 @@ class RayPPOTrainer:
                     if self.config.trainer.balance_batch: # 批次平衡
                         self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    '''
-                    利用AttentionMask计算全局有效token,例如，假设我们有三个句子：
-                    1. "Hello world" (2 tokens)
-                    2. "How are you?" (3 tokens)
-                    3. "I am fine, thank you." (5 tokens)
-                    如果我们将它们组成一个批次，并填充到最长序列的长度（5 tokens），可能会变成这样：
-                    1. "Hello world [PAD] [PAD] [PAD]"
-                    2. "How are you? [PAD] [PAD]"
-                    3. "I am fine, thank you."
-                    这里的 [PAD] 就是填充的 Token。
-                    attention_mask 的作用：为了让模型知道哪些是真实的 Token，哪些是填充的 Token，我们通常会使用一个 attention_mask 。
-                    - attention_mask 是一个与输入序列长度相同的二进制张量。
-                    - 对于真实的 Token， attention_mask 的值为 1 。
-                    - 对于填充的 Token， attention_mask 的值为 0 。
-                    以上面的例子为例，对应的 attention_mask 可能如下
-                    1. [1, 1, 0, 0, 0] 2. [1, 1, 1, 0, 0] 3. [1, 1, 1, 1, 1]
-                    '''
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
 
