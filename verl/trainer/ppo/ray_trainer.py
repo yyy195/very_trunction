@@ -1087,6 +1087,7 @@ class RayPPOTrainer:
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
+                    self.config.trainer.balance_batch = False
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
