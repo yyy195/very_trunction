@@ -47,8 +47,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='yyy-8A800_CUT_Batch_Qwen25-new' \
-    trainer.experiment_name='yyy-Training_CUT_Qwen25_3b-new' \
+    trainer.project_name='yyy-nonoise-ablation' \
+    trainer.experiment_name='yyy-nonoise-ablation' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
