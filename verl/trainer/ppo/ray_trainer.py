@@ -1450,6 +1450,7 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, cut_batch_for_reward, self.reward_fn) # 将各个来源的奖励组合
                             # 其中reward_ten是tensor类型，extra是字典类型，和奖励有关的额外的信息
 
+                    self.config.trainer.balance_batch = False
                     if self.config.trainer.balance_batch: # 批次平衡
                         self._balance_batch(batch, metrics=metrics)
                     # Operating Mode Selection:
