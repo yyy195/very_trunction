@@ -1,10 +1,13 @@
 set -x
 ENGINE=${1:-vllm}
 export WANDB_MODE=offline
-
+# export HYDRA_FULL_ERROR=1
+# export CUDA_DEVICE_ORDER=PCI_BUS_ID
+# export CUDA_VISIBLE_DEVICES=3
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
+    data.seed=8 \
     data.train_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/train.parquet \
     data.val_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/test.parquet \
     data.train_batch_size=256 \
@@ -13,8 +16,11 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=images \
+    trainer.validation_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_valida \
+    trainer.rollout_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_rollout \
+    trainer.cut_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/cut_rollout \
     actor_rollout_ref.model.path=/home/notebook/code/group/zhengxianwu/Project/MM-UPT/Qwen2.5-VL-7B-Instruct \
-    actor_rollout_ref.actor.optim.lr=5e-8 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
@@ -36,14 +42,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.cut_n=5 \
-    actor_rollout_ref.rollout.cut_keep_rate=0.7 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='yyy-Majority_Qwen25_3b' \
-    trainer.experiment_name='yyy-Majority_Qwen25_3b' \
+    trainer.project_name='yyy-8A800_CUT_Batch_Qwen25-new' \
+    trainer.experiment_name='yyy-Training_CUT_Qwen25_3b-new' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
