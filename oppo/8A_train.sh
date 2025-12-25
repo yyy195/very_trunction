@@ -18,7 +18,6 @@ python3 -m verl.trainer.main_ppo \
     data.image_key=images \
     trainer.validation_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_valida \
     trainer.rollout_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_rollout \
-    trainer.cut_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/cut_rollout \
     actor_rollout_ref.model.path=/home/notebook/code/group/zhengxianwu/Project/MM-UPT/Qwen2.5-VL-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
