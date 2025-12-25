@@ -7,7 +7,7 @@ export WANDB_MODE=offline
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.seed=4 \
+    data.seed=15 \
     data.train_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/train.parquet \
     data.val_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/test.parquet \
     data.train_batch_size=256 \
@@ -16,9 +16,6 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=images \
-    trainer.validation_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_valida \
-    trainer.rollout_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/verl_rollout \
-    trainer.cut_data_dir=/home/notebook/code/group/zhengxianwu/others/very_trunction/cut_rollout \
     actor_rollout_ref.model.path=/home/notebook/code/group/zhengxianwu/Project/MM-UPT/Qwen2.5-VL-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \

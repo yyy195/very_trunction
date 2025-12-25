@@ -91,42 +91,37 @@ def calculate_adjusted_reward(
     current_trajectory_answer: Any,
     all_cut_sign_counts_dict: dict,
     max_cut_sign_specific_counts_dict: dict,
-    total_all_answers: int, # 新增参数
-    boost_factor: float = 0.2, # 提升因子
-    penalty_factor: float = 0.1 # 惩罚因子
+    total_all_answers: int,
+    boost_factor: float = 0.2,   # 最大增益上限
+    penalty_factor: float = 0.1,  # 最大惩罚上限
+    sensitivity: float = 10.0
 ) -> float:
-    """计算调整后的奖励。"""
-
-    # 1. 计算基础频率奖励
-    if total_all_answers == 0:
-        base_frequency = 0.0
-    else:
-        base_frequency = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / total_all_answers
+    # 1. 计算频率
+    base_freq = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / (total_all_answers + 1e-6)
     
-    base_reward = base_frequency # 基础奖励可以简单地等于这个频率
-
-    # 2. 根据max_cut_sign进行调整
-    final_reward = base_reward
-
-    total_max_cut_sign_answers = sum(max_cut_sign_specific_counts_dict.values())
-    if total_max_cut_sign_answers > 0:
-        max_cut_sign_frequency = max_cut_sign_specific_counts_dict.get(current_trajectory_answer, 0) / total_max_cut_sign_answers
-    else:
-        max_cut_sign_frequency = 0.0
-
-    # 调整逻辑
-    if max_cut_sign_frequency == 0 and base_frequency > 0:
-        # 情况1: 答案在整体中存在，但在max_cut_sign中不存在。
-        # 这可能表明这是一个“难以找到”的答案，因此我们提升奖励。
-        final_reward += base_reward * boost_factor
-    elif max_cut_sign_frequency > base_frequency and base_frequency > 0:
-        # 情况2: 答案在max_cut_sign中的频率高于整体频率。提升奖励。
-        final_reward += base_reward * boost_factor
-    elif max_cut_sign_frequency < base_frequency and max_cut_sign_frequency > 0:
-        # 情况3: 答案在max_cut_sign中的频率低于整体频率。降低奖励。
-        final_reward -= base_reward * penalty_factor
+    total_max_cut = sum(max_cut_sign_specific_counts_dict.values())
+    if total_max_cut == 0:
+        return base_freq
     
-    # 确保奖励在合理范围 [0, 1]
+    max_cut_freq = max_cut_sign_specific_counts_dict.get(current_trajectory_answer, 0) / total_max_cut
+
+    # 2. 计算分布偏移信号 (Signal)
+    # 使用比率：如果局部频率是全局频率的 2 倍，信号就开始显著
+    # 减 1 是为了让“没有差异”时信号为 0
+    diff_signal = (max_cut_freq / (base_freq + 1e-6)) - 1.0
+
+    if diff_signal > 0:
+        # 使用 Tanh 将 [0, +inf] 映射到 [0, 1]，再乘上 boost_factor
+        # 结果：只要 diff_signal 足够大，增益就无限接近 0.2
+        adjustment = boost_factor * math.tanh(sensitivity * diff_signal)
+    else:
+        # 同理，映射惩罚项
+        adjustment = penalty_factor * math.tanh(sensitivity * diff_signal)
+
+    # 4. 最终奖励计算
+    # 这里采用 base * (1 + adjustment) 逻辑，即实现你说的 "提升 20%"
+    final_reward = base_freq * (1 + adjustment)
+
     return max(0.0, min(1.0, final_reward))
 
 
@@ -268,7 +263,7 @@ class TruncRewardManager(AbstractRewardManager):
                         current_trajectory_answer,
                         all_cut_sign_counts_dict,
                         max_cut_sign_specific_counts_dict,
-                        total_all_answers
+                        total_all_answers,
                     ) 
                     format_score = format_reward(response_content[current_trajectory_index])
                     score = 0.9 * freq_score + 0.1 * format_score
