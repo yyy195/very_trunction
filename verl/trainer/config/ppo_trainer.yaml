@@ -141,13 +141,13 @@ trainer:
   log_val_generations: 0
 
   # Directory for logging rollout data; no dump if null
-  rollout_data_dir: /data1/yyy25/verl/verl_rollout
+  rollout_data_dir: null
 
   # Directory for logging validation data; no dump if null
-  validation_data_dir: /data1/yyy25/verl/verl_valida
+  validation_data_dir: null
 
   # Look through trunction new rollouts
-  cut_data_dir: /data1/yyy25/verl/cut_rollout
+  cut_data_dir: null
 
   # Number of nodes used in the training
   nnodes: 1

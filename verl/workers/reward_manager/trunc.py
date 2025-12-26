@@ -94,7 +94,7 @@ def calculate_adjusted_reward(
     total_all_answers: int,
     boost_factor: float = 0.2,   # 最大增益上限
     penalty_factor: float = 0.1,  # 最大惩罚上限
-    sensitivity: float = 10.0
+    sensitivity: float = 100.0
 ) -> float:
     # 1. 计算频率
     base_freq = all_cut_sign_counts_dict.get(current_trajectory_answer, 0) / (total_all_answers + 1e-6)
