@@ -7,7 +7,7 @@ export WANDB_MODE=offline
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.seed=15 \
+    data.seed=26 \
     data.train_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/train.parquet \
     data.val_files=/home/notebook/code/group/zhengxianwu/Project/Project2/dataset-all/geometry3k-verl/test.parquet \
     data.train_batch_size=256 \
